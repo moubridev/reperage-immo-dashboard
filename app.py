@@ -22,8 +22,9 @@ from streamlit_folium import st_folium
 import folium
 from folium.plugins import MarkerCluster
 
+from lib import get_credentials
+
 DASHBOARD_DIR = Path(__file__).parent
-ENV_PATH = Path("/home/antoine/moubri/.env")
 FILTERS_PATH = DASHBOARD_DIR / "last_filters.json"
 
 # Vue Supabase dédiée (lecture seule, clé anon/publishable) — jamais la table
@@ -35,35 +36,6 @@ SELECT_FIELDS = (
 )
 
 st.set_page_config(page_title="Repérage Immo", page_icon="🗺️", layout="wide")
-
-
-def load_env():
-    env = {}
-    if ENV_PATH.exists():
-        for line in ENV_PATH.read_text().splitlines():
-            line = line.strip()
-            if not line or line.startswith("#") or "=" not in line:
-                continue
-            k, v = line.split("=", 1)
-            env[k.strip()] = v.strip().strip('"').strip("'")
-    return env
-
-
-def get_credentials():
-    """Streamlit Cloud: st.secrets (clé anon/publishable, lecture seule).
-    Local: fallback sur moubri/.env pour le confort de dev — mais on lit
-    SUPABASE_ANON_KEY en priorité, jamais la service_role, pour que le
-    comportement local et déployé restent identiques."""
-    try:
-        has_secrets = "SUPABASE_URL" in st.secrets and "SUPABASE_ANON_KEY" in st.secrets
-    except Exception:
-        has_secrets = False  # pas de secrets.toml local — normal en dev
-    if has_secrets:
-        return st.secrets["SUPABASE_URL"], st.secrets["SUPABASE_ANON_KEY"]
-    env = load_env()
-    url = env.get("SUPABASE_URL")
-    key = env.get("SUPABASE_ANON_KEY") or env.get("SUPABASE_KEY")
-    return url, key
 
 
 def region_of(cp):
