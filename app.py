@@ -254,7 +254,7 @@ def compute_colocation_scores(df_scope):
         return d
 
     communes_ref = fetch_reference("v_dashboard_communes", "code_ins,nom_commune,densite_hab_km2,distance_gare_km")
-    loyers_ref = fetch_reference("v_dashboard_loyers", "code_ins,type_bien,loyer_median")
+    loyers_ref = fetch_reference("v_dashboard_loyers", "code_ins,type_bien,loyer_median,annee").rename(columns={"annee": "annee_loyer"})
     communes_ref["commune_norm"] = communes_ref["nom_commune"].str.strip().str.upper()
     d["commune_norm"] = d["commune"].str.strip().str.upper()
     d = d.merge(communes_ref[["commune_norm", "code_ins", "densite_hab_km2", "distance_gare_km"]], on="commune_norm", how="left")
@@ -502,7 +502,8 @@ if transaction == "location":
         "25% distance université + 20% distance pôle d'emploi + 15% transport (proxy : distance gare la plus proche) "
         "+ 15% densité de population (commune) + 15% nombre de chambres + 10% loyer médian du secteur, sur 10. "
         "Bonus/malus : +2 si université ≤15km, +1 si densité >5000 hab/km², −1 si rural ET emploi >40km. "
-        "**Le veto \"électricité non conforme\" du document original n'est pas calculable depuis les annonces — à vérifier impérativement en visite, jamais automatique.**"
+        "**Le veto \"électricité non conforme\" du document original n'est pas calculable depuis les annonces — à vérifier impérativement en visite, jamais automatique.** "
+        "Le loyer médian de secteur (`communes_loyers_marche`) a une fraîcheur variable selon la commune (2023 à 2026) — voir colonne « Année réf. »."
     )
     with st.spinner("Calcul du score colocation..."):
         coloc = compute_colocation_scores(f)
@@ -517,13 +518,13 @@ if transaction == "location":
 
         coloc_table = coloc.head(200)[[
             "verdict_coloc", "commune", "code_postal", "prix", "nb_chambres",
-            "dist_universite_km", "dist_emploi_km", "distance_gare_km", "loyer_median",
+            "dist_universite_km", "dist_emploi_km", "distance_gare_km", "loyer_median", "annee_loyer",
             "score_coloc", "url_principale",
         ]].rename(columns={
             "verdict_coloc": "Verdict", "commune": "Commune", "code_postal": "CP", "prix": "Loyer (€)",
             "nb_chambres": "Ch.", "dist_universite_km": "Dist. univ. (km)", "dist_emploi_km": "Dist. emploi (km)",
             "distance_gare_km": "Dist. gare (km)", "loyer_median": "Loyer médian secteur (€)",
-            "score_coloc": "Score /10", "url_principale": "Annonce",
+            "annee_loyer": "Année réf.", "score_coloc": "Score /10", "url_principale": "Annonce",
         })
         st.dataframe(
             coloc_table, use_container_width=True, height=420, hide_index=True,
