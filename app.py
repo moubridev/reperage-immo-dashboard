@@ -54,7 +54,11 @@ def get_credentials():
     Local: fallback sur moubri/.env pour le confort de dev — mais on lit
     SUPABASE_ANON_KEY en priorité, jamais la service_role, pour que le
     comportement local et déployé restent identiques."""
-    if "SUPABASE_URL" in st.secrets and "SUPABASE_ANON_KEY" in st.secrets:
+    try:
+        has_secrets = "SUPABASE_URL" in st.secrets and "SUPABASE_ANON_KEY" in st.secrets
+    except Exception:
+        has_secrets = False  # pas de secrets.toml local — normal en dev
+    if has_secrets:
         return st.secrets["SUPABASE_URL"], st.secrets["SUPABASE_ANON_KEY"]
     env = load_env()
     url = env.get("SUPABASE_URL")
@@ -126,7 +130,102 @@ def build_frame():
     df["type_bien"] = df["type_bien"].fillna("autre")
     df["commune"] = df["commune"].fillna("?")
     df["peb"] = df["peb"].fillna("n.c.")
+    # `code_ins` est NULL sur ~98% de la base (Dev Log 2026-08-31) : le seul
+    # regroupement géo fiable disponible ici est le texte libre `commune`, qui
+    # contient des variantes de casse ("Mons" / "MONS"). On normalise au moins
+    # ça pour ne pas fragmenter artificiellement les comparables.
+    df["commune_norm"] = df["commune"].str.strip().str.upper()
+
+    # Comparable marché "prix/m²" par commune, tous types/PEB confondus (pour le
+    # ratio "vs marché local") — calculé sur tout le jeu de données, pas sur la
+    # sélection filtrée, pour rester un vrai comparable indépendant des filtres.
+    commune_comp_all = df.groupby("commune_norm")["prix_m2"].median()
+    df["commune_prix_m2_median"] = df["commune_norm"].map(commune_comp_all)
+    df["ecart_vs_marche_pct"] = (
+        (df["prix_m2"] - df["commune_prix_m2_median"]) / df["commune_prix_m2_median"] * 100
+    )
     return df, fetched_at
+
+
+PEB_RENOVES = {"A++", "A+", "A", "B"}
+
+
+def compute_mdb_scores(
+    df_scope, df_all, peb_cibles, taux_enregistrement_pct, cout_travaux_m2,
+    frais_vente_pct, taux_financier_annuel_pct, duree_portage_mois, appliquer_isoc, isoc_pct,
+):
+    """Marge d'un flip MdB, structurée comme `charge_fonciere.py` (Dev Log
+    2026-08-31 : C = (R_nette − Cc − Ca − Marge − 0,5·Cc·f) / (1 + e + f)) —
+    mais ici le prix d'achat est CONNU (l'annonce), donc pas de circularité à
+    résoudre : on calcule la marge résultante plutôt que le prix maximum.
+
+    Corrige les deux trous identifiés dans l'ancienne formule "référence
+    rapide" (notés comme un bug réel dans Moubri.md sur le rapport Fichaux 6) :
+    les frais de revente et le coût de portage/financement étaient absents.
+
+    ARV comparé sur des ANNONCES (prix demandés, pas des ventes réelles) —
+    limite connue, à améliorer en branchant `transactions_spf_wallonie`.
+    """
+    comp_base = df_all[df_all["peb"].isin(PEB_RENOVES)]
+    comp_commune = comp_base.groupby("commune_norm")["prix_m2"].median()
+    comp_region = comp_base.groupby("region")["prix_m2"].median()
+    comp_commune_n = comp_base.groupby("commune_norm")["prix_m2"].count()
+
+    # Garde-fou plausibilité : la surface habitable est un champ connu pour ses
+    # erreurs de collecte (souvent confondue avec la surface du terrain). Une
+    # "maison" de 2000 m² à 100 000 € n'est pas un bon deal, c'est une donnée
+    # fausse — sans ce filtre elle remonte artificiellement en tête de liste.
+    surface_ok = (
+        (df_scope["type_bien"].eq("appartement") & df_scope["surface_habitable"].between(15, 350))
+        | (df_scope["type_bien"].eq("maison") & df_scope["surface_habitable"].between(25, 600))
+    )
+    d = df_scope[
+        df_scope["type_bien"].isin(["maison", "appartement"])
+        & df_scope["peb"].isin(peb_cibles)
+        & df_scope["prix"].notna()
+        & surface_ok
+    ].copy()
+    if d.empty:
+        return d
+
+    n_comp = d["commune_norm"].map(comp_commune_n).fillna(0)
+    comp_m2 = d["commune_norm"].map(comp_commune)
+    comp_m2 = comp_m2.where(n_comp >= 5, d["region"].map(comp_region))
+    d["n_comparables"] = n_comp.astype(int)
+    d["comparable_source"] = ["commune" if n >= 5 else "région" for n in n_comp]
+
+    e = taux_enregistrement_pct / 100
+    f = (taux_financier_annuel_pct / 100) * (duree_portage_mois / 12)
+
+    d["arv_brut"] = comp_m2 * d["surface_habitable"] * 1.05
+    d["cout_travaux"] = d["surface_habitable"] * cout_travaux_m2
+    d["cout_enregistrement"] = d["prix"] * e
+    # Portage : capital immobilisé = prix payé dès le jour 1 + travaux tirés
+    # progressivement (approximé à la moitié du budget travaux, comme dans
+    # charge_fonciere.py : "0,5·Cc·f").
+    d["cout_financier"] = (d["prix"] + 0.5 * d["cout_travaux"]) * f
+    d["cout_vente"] = d["arv_brut"] * (frais_vente_pct / 100)
+
+    d["marge_eur"] = (
+        d["arv_brut"] - d["prix"] - d["cout_enregistrement"] - d["cout_travaux"]
+        - d["cout_financier"] - d["cout_vente"]
+    )
+    if appliquer_isoc:
+        d["marge_eur"] = d["marge_eur"].clip(lower=0) * (1 - isoc_pct / 100) + d["marge_eur"].clip(upper=0)
+    d["marge_pct"] = (d["marge_eur"] / d["arv_brut"] * 100)
+
+    d = d[d["arv_brut"].notna() & d["marge_pct"].notna()]
+    return d
+
+
+def statut_mdb(marge_pct, seuil_go_fort, seuil_go, seuil_limite):
+    if marge_pct >= seuil_go_fort:
+        return "🔴 GO fort"
+    if marge_pct >= seuil_go:
+        return "🟡 GO"
+    if marge_pct >= seuil_limite:
+        return "⚪ Limite"
+    return "⬛ Écarté"
 
 
 def load_last_filters():
@@ -191,11 +290,32 @@ with st.sidebar.expander("Plus de filtres"):
     annee_min = st.number_input("Construit après", min_value=0, step=1, value=defaults.get("annee_min", 0))
     jours_max = st.number_input("En ligne depuis moins de X jours (0 = pas de limite)", min_value=0, step=5, value=defaults.get("jours_max", 0))
 
+st.sidebar.markdown("---")
+st.sidebar.subheader("🎯 Analyse marchand de biens")
+with st.sidebar.expander("Hypothèses de calcul", expanded=False):
+    peb_cibles = st.multiselect("PEB cible (achat dégradé)", ["G", "F", "E", "D", "C"], default=defaults.get("peb_cibles", ["G", "F", "E"]))
+    taux_enregistrement_pct = st.number_input("Droits d'enregistrement (%)", min_value=0.0, max_value=20.0, value=defaults.get("taux_enregistrement_pct", 7.5), step=0.5, help="Non confirmé avec un comptable (régime MdB) — voir Shortlist-GO-Mons-2026-06-11.")
+    cout_travaux_m2 = st.number_input("Coût travaux (€/m²)", min_value=0, max_value=3000, value=defaults.get("cout_travaux_m2", 850), step=50, help="Forfait unique quel que soit l'écart PEB — à affiner par palier si besoin.")
+    frais_vente_pct = st.number_input("Frais de revente (%)", min_value=0.0, max_value=15.0, value=defaults.get("frais_vente_pct", 6.0), step=0.5, help="Agence + notaire à la revente. Absent de l'ancienne formule — c'est le bug déjà noté sur le rapport Fichaux 6.")
+    taux_financier_annuel_pct = st.number_input("Coût du capital annuel (%)", min_value=0.0, max_value=15.0, value=defaults.get("taux_financier_annuel_pct", 5.0), step=0.5, help="Taux de financement ou coût d'opportunité si cash.")
+    duree_portage_mois = st.number_input("Durée de portage (mois)", min_value=1, max_value=60, value=defaults.get("duree_portage_mois", 9), step=1)
+    appliquer_isoc = st.checkbox("Vente via société — appliquer l'ISOC sur la marge", value=defaults.get("appliquer_isoc", False))
+    isoc_pct = st.number_input("Taux ISOC (%)", min_value=0.0, max_value=40.0, value=defaults.get("isoc_pct", 25.0), step=1.0, disabled=not appliquer_isoc)
+    st.markdown("**Seuils de classement**")
+    seuil_go_fort = st.number_input("Seuil GO fort (marge % ≥)", min_value=0, max_value=200, value=defaults.get("seuil_go_fort", 30), step=5)
+    seuil_go = st.number_input("Seuil GO (marge % ≥)", min_value=0, max_value=200, value=defaults.get("seuil_go", 15), step=5)
+    seuil_limite = st.number_input("Seuil Limite (marge % ≥)", min_value=0, max_value=200, value=defaults.get("seuil_limite", 5), step=5)
+
 if st.sidebar.button("💾 Sauvegarder ces critères par défaut"):
     save_last_filters({
         "transaction": transaction, "regions": regions_sel, "commune_query": commune_query,
         "budget": [budget_min, budget_max], "surf_min": surf_min, "types": types_sel,
         "chambres_min": chambres_min, "annee_min": annee_min, "jours_max": jours_max,
+        "peb_cibles": peb_cibles, "taux_enregistrement_pct": taux_enregistrement_pct,
+        "cout_travaux_m2": cout_travaux_m2, "frais_vente_pct": frais_vente_pct,
+        "taux_financier_annuel_pct": taux_financier_annuel_pct, "duree_portage_mois": duree_portage_mois,
+        "appliquer_isoc": appliquer_isoc, "isoc_pct": isoc_pct,
+        "seuil_go_fort": seuil_go_fort, "seuil_go": seuil_go, "seuil_limite": seuil_limite,
     })
     st.sidebar.success("Enregistré ✓")
 
@@ -231,6 +351,70 @@ k2.metric("Prix médian", f"{int(f['prix'].median()):,} €".replace(",", " ") i
 k3.metric("Prix/m² médian", f"{int(f['prix_m2'].median()):,} €".replace(",", " ") if f["prix_m2"].notna().any() else "—")
 k4.metric("Surface médiane", f"{int(f['surface_habitable'].median())} m²" if f["surface_habitable"].notna().any() else "—")
 k5.metric("En ligne depuis (médiane)", f"{int(f['jours_sur_marche'].median())} j." if f["jours_sur_marche"].notna().any() else "—")
+
+st.markdown("---")
+
+# ---------------------------------------------------------------- analyse MdB
+
+st.subheader("🎯 Meilleures opportunités — achat dégradé → rénovation → revente")
+st.caption(
+    "Marge = ARV brut − prix − enregistrement − travaux − portage/financement − frais de revente"
+    + (" − ISOC" if appliquer_isoc else "") + ". "
+    "ARV comparé sur des **annonces** PEB A-B du secteur (prix demandés, pas des ventes réelles — "
+    "sous-estime probablement la fiabilité). **Un tri pour prioriser les visites, jamais une offre.**"
+)
+
+mdb = compute_mdb_scores(
+    f, df, peb_cibles, taux_enregistrement_pct, cout_travaux_m2,
+    frais_vente_pct, taux_financier_annuel_pct, duree_portage_mois, appliquer_isoc, isoc_pct,
+)
+
+if mdb.empty:
+    st.info("Aucun bien PEB " + "/".join(peb_cibles) + " (maison ou appartement) dans la sélection actuelle.")
+else:
+    mdb["statut"] = mdb["marge_pct"].apply(lambda m: statut_mdb(m, seuil_go_fort, seuil_go, seuil_limite))
+    mdb = mdb.sort_values("marge_pct", ascending=False)
+
+    m1, m2, m3, m4 = st.columns(4)
+    m1.metric("🔴 GO fort", int((mdb["statut"] == "🔴 GO fort").sum()))
+    m2.metric("🟡 GO", int((mdb["statut"] == "🟡 GO").sum()))
+    m3.metric("⚪ Limite", int((mdb["statut"] == "⚪ Limite").sum()))
+    go_df = mdb[mdb["statut"].isin(["🔴 GO fort", "🟡 GO"])]
+    m4.metric("Marge médiane (GO)", f"{go_df['marge_pct'].median():.0f} %" if not go_df.empty else "—")
+
+    low_n = int((mdb["n_comparables"] < 5).sum())
+    if low_n:
+        st.caption(f"⚠️ {low_n} biens notés avec un comparable de secours au niveau région (moins de 5 annonces PEB A-B trouvées dans leur commune) — marge moins fiable pour ceux-là, colonne « Comparable ».")
+
+    show = mdb[mdb["statut"] != "⬛ Écarté"].head(200)
+    top_table = show[
+        ["statut", "commune", "code_postal", "prix", "peb", "surface_habitable", "nb_chambres",
+         "jours_sur_marche", "arv_brut", "cout_travaux", "cout_financier", "cout_vente",
+         "marge_pct", "comparable_source", "n_comparables", "url_principale"]
+    ].rename(columns={
+        "statut": "Statut", "commune": "Commune", "code_postal": "CP", "prix": "Prix (€)",
+        "peb": "PEB", "surface_habitable": "Surface (m²)", "nb_chambres": "Ch.",
+        "jours_sur_marche": "Jours en ligne", "arv_brut": "ARV brut (€)",
+        "cout_travaux": "Travaux (€)", "cout_financier": "Portage (€)", "cout_vente": "Frais revente (€)",
+        "marge_pct": "Marge %", "comparable_source": "Comparable", "n_comparables": "N comp.",
+        "url_principale": "Annonce",
+    })
+    st.dataframe(
+        top_table,
+        use_container_width=True,
+        height=420,
+        hide_index=True,
+        column_config={
+            "Annonce": st.column_config.LinkColumn("Annonce", display_text="Voir ↗"),
+            "Marge %": st.column_config.NumberColumn("Marge %", format="%.0f %%"),
+            "Prix (€)": st.column_config.NumberColumn("Prix (€)", format="%d €"),
+            "ARV brut (€)": st.column_config.NumberColumn("ARV brut (€)", format="%d €"),
+            "Travaux (€)": st.column_config.NumberColumn("Travaux (€)", format="%d €"),
+            "Portage (€)": st.column_config.NumberColumn("Portage (€)", format="%d €"),
+            "Frais revente (€)": st.column_config.NumberColumn("Frais revente (€)", format="%d €"),
+        },
+    )
+    st.caption(f"{len(mdb) - len(show)} biens supplémentaires écartés ou hors du top 200 (ajustez les filtres pour affiner).")
 
 st.markdown("---")
 
@@ -303,18 +487,23 @@ st.markdown("---")
 # ---------------------------------------------------------------- table
 
 st.subheader("Liste des annonces")
+st.caption("« vs marché » = écart du prix/m² par rapport à la médiane de la commune (tous types/PEB confondus). Négatif = sous le marché local.")
 table_df = f.sort_values("jours_sur_marche", na_position="last")[
     ["commune", "code_postal", "type_bien", "prix", "surface_habitable", "nb_chambres",
-     "annee_construction", "peb", "jours_sur_marche", "url_principale"]
+     "annee_construction", "peb", "jours_sur_marche", "ecart_vs_marche_pct", "url_principale"]
 ].rename(columns={
     "code_postal": "CP", "type_bien": "Type", "prix": "Prix (€)", "surface_habitable": "Surface (m²)",
     "nb_chambres": "Chambres", "annee_construction": "Année", "peb": "PEB",
-    "jours_sur_marche": "Jours en ligne", "url_principale": "Annonce", "commune": "Commune",
+    "jours_sur_marche": "Jours en ligne", "ecart_vs_marche_pct": "vs marché (%)",
+    "url_principale": "Annonce", "commune": "Commune",
 })
 st.dataframe(
     table_df,
     use_container_width=True,
     height=420,
-    column_config={"Annonce": st.column_config.LinkColumn("Annonce", display_text="Voir ↗")},
+    column_config={
+        "Annonce": st.column_config.LinkColumn("Annonce", display_text="Voir ↗"),
+        "vs marché (%)": st.column_config.NumberColumn("vs marché (%)", format="%+.0f %%"),
+    },
     hide_index=True,
 )
