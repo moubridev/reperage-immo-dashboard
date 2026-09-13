@@ -93,6 +93,7 @@ num_cols = [
     "anciennete_active_jours", "n_annonces_actives",
     "distance_gare_km", "centroid_lat", "centroid_lng",
     "pct_parc_degrade", "rendement_locatif_brut_pct", "permis_neuf_logements_12m",
+    "prime_renovation_eur_m2", "prime_renovation_pct", "n_bon_peb", "n_degrade",
 ]
 for c in num_cols:
     if c in df.columns:
@@ -153,7 +154,8 @@ la vue SQL `v_dashboard_communes`.
 | Revenu, chômage, % propriétaires | Statbel, tels quels |
 | Parc dégradé (E-F-G) | Somme des % du parc en PEB E+F+G, `communes_peb_stock`, dernière année dispo (tous types de logements confondus) |
 | Rendement locatif brut | Moyenne maison+appartement, `communes_rendement_locatif`, dernière année |
-| Permis neuf | Logements neufs autorisés, `communes_permis_batir`, dernière année — **volontairement affiché seul** : la colonne "rénovation" existe dans la source mais est à 0 sur 100% des lignes (jamais alimentée), donc pas de vraie distinction résidentiel/économique possible avec cette table |
+| Permis neuf | Logements neufs autorisés, `communes_permis_batir`, dernière année — le volet rénovation existe chez Statbel (vérifié réel) mais l'import actuel ne le lit pas ; correctif écrit, pas encore déployé |
+| Prime de rénovation | Écart médian de prix/m² entre annonces PEB A-B et PEB E-F-G, même commune (calculé depuis les annonces déjà en base, ≥5 annonces de chaque côté requis) |
 
 **Table écartée après vérification :** `communes_fiscalite_immo` — les taux d'enregistrement et le précompte sont vides à 100%, et le "coefficient additionnel communal" affiché comme rempli est en réalité **une valeur constante (2600) sur les 338 communes** — une donnée placeholder, pas une vraie donnée fiscale locale. Non utilisée.
 """)
@@ -202,13 +204,17 @@ with c1:
     d3.metric("% propriétaires", f"{row['pct_proprietaires']:.0f} %" if pd.notna(row["pct_proprietaires"]) else "n.c.")
 
     st.markdown("**Marché élargi** (hors score — indicatif)")
-    e1, e2, e3 = st.columns(3)
+    e1, e2, e3, e4 = st.columns(4)
     e1.metric("Parc dégradé (E-F-G)", f"{row['pct_parc_degrade']:.0f} %" if pd.notna(row["pct_parc_degrade"]) else "n.c.",
               help="% du parc de logements total (tous types) en PEB E, F ou G — l'ampleur du marché potentiel pour un achat dégradé → rénovation. Source : communes_peb_stock.")
     e2.metric("Rendement locatif brut", f"{row['rendement_locatif_brut_pct']:.1f} %" if pd.notna(row["rendement_locatif_brut_pct"]) else "n.c.",
               help="Moyenne maison+appartement, loyer annuel ÷ prix d'achat. Source : communes_rendement_locatif.")
     e3.metric("Permis neuf (dernière année)", f"{row['permis_neuf_logements_12m']:.0f} logements" if pd.notna(row["permis_neuf_logements_12m"]) else "n.c.",
-              help="Logements neufs autorisés — future concurrence à la revente si résidentiel. ⚠️ Les permis de rénovation existent dans la source mais sont à 0 partout (colonne non alimentée) — non affichés ici.")
+              help="Logements neufs autorisés — future concurrence à la revente si résidentiel. Le volet rénovation existe chez Statbel mais l'import ne le lit pas encore (correctif prêt, pas déployé) — non affiché ici pour l'instant.")
+    e4.metric("Prime de rénovation", f"+{row['prime_renovation_pct']:.0f} %" if pd.notna(row["prime_renovation_pct"]) else "n.c. (échantillon insuffisant)",
+              help="Écart de prix/m² médian entre annonces PEB A-B et PEB E-F-G, même commune, maison+appartement. "
+                   + (f"Basé sur {int(row['n_bon_peb'])} annonces bon PEB et {int(row['n_degrade'])} dégradées." if pd.notna(row.get("n_bon_peb")) else "")
+                   + " Indicatif : est-ce que le marché local paie la rénovation ? Ne remplace pas la formule de marge MdB (qui compare déjà au comparable bon PEB, pas au prix dégradé).")
 
 with c2:
     st.subheader("Radar — 4 piliers")
