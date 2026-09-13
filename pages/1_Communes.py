@@ -107,6 +107,8 @@ num_cols = [
     "pct_parc_degrade", "rendement_locatif_brut_pct", "permis_neuf_logements_12m",
     "prime_renovation_eur_m2", "prime_renovation_pct", "n_bon_peb", "n_degrade",
     "distance_zone_houillere_km",
+    "nb_entreprises_bep", "nb_entreprises_idelux", "nb_entreprises_idea",
+    "nb_emploi_idea", "superficie_disponible_idea_m2",
 ]
 for c in num_cols:
     if c in df.columns:
@@ -171,6 +173,7 @@ la vue SQL `v_dashboard_communes`.
 | Prime de rénovation | Écart médian de prix/m² entre annonces PEB A-B et PEB E-F-G, même commune (calculé depuis les annonces déjà en base, ≥5 annonces de chaque côté requis) |
 | Projets UE (Kohesio) | 3 888 projets européens belges (2014-2020, FEDER/FSE) téléchargés depuis `cohesiondata.ec.europa.eu` (dataset officiel), rattachés à la commune la plus proche par distance au centroïde (seuil 15 km, pour exclure les projets flamands). **Approximatif** : pas un géocodage à l'adresse, une commune rurale étendue peut absorber un projet en réalité situé dans une commune voisine plus petite. 2 364/3 888 projets rattachés (les autres : hors zone ou >15 km, essentiellement flamands). Aucune donnée 2021-2027 disponible au niveau projet à ce jour. |
 | Risque minier | Distance du centroïde communal à la concession minière de houille ou zone déhouillée (Bassin de Mons) la plus proche — couche officielle SPW (`geoservices.wallonie.be`, service WFS INSPIRE), 157 polygones houille/déhouillées filtrés sur 360 concessions minières wallonnes (métal, fer, or, houille...). **Approximatif** : distance au centroïde communal, pas une vérification à la parcelle — une commune peut avoir 0 km affiché alors qu'une adresse précise est loin de la zone réelle, ou l'inverse. 40/283 communes ont leur centroïde dans une zone. Non stocké en géométrie brute dans Supabase (cohérent avec l'architecture 3 niveaux du plan) — seule la distance calculée est conservée. |
+| Parcs d'activité économique | Comptage d'entreprises sur les parcs économiques : IDEA (Hainaut/Mons-Borinage, avec emplois et surface disponible par parc — source `odwb.be`), BEP (Namur), IDELUX (Luxembourg). SPI (Liège) : pas de source en open data trouvée. **Snapshot statique** — aucune des 3 sources ne publie de date d'implantation, donc pas un signal "investissements récents" à proprement parler, juste "présence économique actuelle". Matching commune fait par nom de localité (accents normalisés + table de correspondance village→commune post-fusion 1977) — 94-100% de taux de correspondance selon la source, le résidu (localités rares/mal orthographiées) n'est pas comptabilisé plutôt que mal attribué. |
 
 **Table écartée après vérification :** `communes_fiscalite_immo` — les taux d'enregistrement et le précompte sont vides à 100%, et le "coefficient additionnel communal" affiché comme rempli est en réalité **une valeur constante (2600) sur les 338 communes** — une donnée placeholder, pas une vraie donnée fiscale locale. Non utilisée.
 """)
@@ -251,6 +254,16 @@ with c1:
                   help="Distance du centroïde communal à la concession minière de houille ou zone déhouillée (Bassin de Mons) SPW la plus proche — 0 = centroïde dans la zone. Approximatif (centroïde, pas parcelle par parcelle). Ancien bassin minier = risque d'affaissement/cavités à vérifier avant achat, pas un empêchement automatique. Source : geoservices.wallonie.be.")
     else:
         st.caption("Pas de donnée de risque minier pour cette commune.")
+
+    nb_parcs = int((row.get("nb_entreprises_bep") or 0) + (row.get("nb_entreprises_idelux") or 0) + (row.get("nb_entreprises_idea") or 0))
+    if nb_parcs > 0:
+        st.markdown("**🏭 Parcs d'activité économique** (hors score — indicatif, ajouté le 13/09)")
+        p1, p2 = st.columns(2)
+        p1.metric("Entreprises sur parcs (snapshot)", f"{nb_parcs}",
+                  help="Nombre d'entreprises implantées sur les parcs d'activité économique de la commune. Sources combinées : IDEA (Hainaut/Mons-Borinage), BEP (Namur), IDELUX (Luxembourg). SPI (Liège) non trouvé en open data. Snapshot statique — pas de date d'implantation disponible, donc pas un signal de tendance récente.")
+        emploi = row.get("nb_emploi_idea")
+        p2.metric("Emplois estimés (IDEA)", f"{int(emploi)}" if pd.notna(emploi) and emploi else "n.c.",
+                  help="Emplois recensés sur les parcs IDEA de la commune (donnée non disponible pour BEP/IDELUX dans cette source).")
 
 with c2:
     st.subheader("Radar — 4 piliers")
