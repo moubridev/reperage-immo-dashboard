@@ -106,6 +106,7 @@ num_cols = [
     "distance_gare_km", "centroid_lat", "centroid_lng",
     "pct_parc_degrade", "rendement_locatif_brut_pct", "permis_neuf_logements_12m",
     "prime_renovation_eur_m2", "prime_renovation_pct", "n_bon_peb", "n_degrade",
+    "distance_zone_houillere_km",
 ]
 for c in num_cols:
     if c in df.columns:
@@ -169,6 +170,7 @@ la vue SQL `v_dashboard_communes`.
 | Permis neuf | Logements neufs autorisés, `communes_permis_batir`, dernière année — le volet rénovation existe chez Statbel (vérifié réel) mais l'import actuel ne le lit pas ; correctif écrit, pas encore déployé |
 | Prime de rénovation | Écart médian de prix/m² entre annonces PEB A-B et PEB E-F-G, même commune (calculé depuis les annonces déjà en base, ≥5 annonces de chaque côté requis) |
 | Projets UE (Kohesio) | 3 888 projets européens belges (2014-2020, FEDER/FSE) téléchargés depuis `cohesiondata.ec.europa.eu` (dataset officiel), rattachés à la commune la plus proche par distance au centroïde (seuil 15 km, pour exclure les projets flamands). **Approximatif** : pas un géocodage à l'adresse, une commune rurale étendue peut absorber un projet en réalité situé dans une commune voisine plus petite. 2 364/3 888 projets rattachés (les autres : hors zone ou >15 km, essentiellement flamands). Aucune donnée 2021-2027 disponible au niveau projet à ce jour. |
+| Risque minier | Distance du centroïde communal à la concession minière de houille ou zone déhouillée (Bassin de Mons) la plus proche — couche officielle SPW (`geoservices.wallonie.be`, service WFS INSPIRE), 157 polygones houille/déhouillées filtrés sur 360 concessions minières wallonnes (métal, fer, or, houille...). **Approximatif** : distance au centroïde communal, pas une vérification à la parcelle — une commune peut avoir 0 km affiché alors qu'une adresse précise est loin de la zone réelle, ou l'inverse. 40/283 communes ont leur centroïde dans une zone. Non stocké en géométrie brute dans Supabase (cohérent avec l'architecture 3 niveaux du plan) — seule la distance calculée est conservée. |
 
 **Table écartée après vérification :** `communes_fiscalite_immo` — les taux d'enregistrement et le précompte sont vides à 100%, et le "coefficient additionnel communal" affiché comme rempli est en réalité **une valeur constante (2600) sur les 338 communes** — une donnée placeholder, pas une vraie donnée fiscale locale. Non utilisée.
 """)
@@ -235,6 +237,20 @@ with c1:
               help="Nombre de projets européens (FEDER/FSE, période 2014-2020) rattachés à cette commune par proximité géographique (distance au centroïde communal, seuil 15 km). Rattachement approximatif — pas un géocodage exact à l'adresse. Source : cohesiondata.ec.europa.eu.")
     u2.metric("Budget UE cumulé", f"{row['budget_ue_total_eur']:,.0f} €".replace(",", " ") if row["budget_ue_total_eur"] else "0 €",
               help="Somme du financement européen (project_eu_budget) des projets rattachés. 0 ne veut pas dire 'aucun investissement UE dans la zone' — signifie qu'aucun projet du dataset 2014-2020 n'a été rattaché à moins de 15 km du centroïde.")
+
+    st.markdown("**⚠️ Risque minier** (hors score — indicatif, ajouté le 13/09)")
+    dist_minier = row.get("distance_zone_houillere_km")
+    if pd.notna(dist_minier):
+        if dist_minier == 0:
+            minier_label, minier_delta = "Dans une zone houillère", "⚠️"
+        elif dist_minier < 5:
+            minier_label, minier_delta = f"{dist_minier:.1f} km d'une zone houillère", "à surveiller"
+        else:
+            minier_label, minier_delta = f"{dist_minier:.1f} km d'une zone houillère", None
+        st.metric("Distance zone houillère/déhouillée (SPW)", minier_label,
+                  help="Distance du centroïde communal à la concession minière de houille ou zone déhouillée (Bassin de Mons) SPW la plus proche — 0 = centroïde dans la zone. Approximatif (centroïde, pas parcelle par parcelle). Ancien bassin minier = risque d'affaissement/cavités à vérifier avant achat, pas un empêchement automatique. Source : geoservices.wallonie.be.")
+    else:
+        st.caption("Pas de donnée de risque minier pour cette commune.")
 
 with c2:
     st.subheader("Radar — 4 piliers")
