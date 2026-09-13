@@ -96,7 +96,6 @@ def fetch_annonces():
     while True:
         params = {
             "select": SELECT_FIELDS,
-            "order": "commune",
             "limit": page_size,
             "offset": offset,
         }
