@@ -6,6 +6,10 @@ Phase 1 du plan d'intelligence territoriale (voir vault Moubri,
 PLAN_INTELLIGENCE_TERRITORIALE.md). Toutes les données viennent de
 v_dashboard_communes / v_dashboard_communes_historique (vues Supabase
 dédiées, clé anon — jamais les tables de base ni service_role).
+
+Scoring reconstruit le 2026-09-13 : l'ancien score (communes_score_investissement)
+n'avait aucune formule documentée retrouvable. Remplacé par 4 piliers dont la
+formule est écrite ci-dessous et vérifiable dans v_dashboard_communes (vue SQL).
 """
 
 from datetime import datetime
@@ -25,8 +29,8 @@ st.set_page_config(page_title="Communes — Repérage Immo", page_icon="🏘️"
 COMMUNES_VIEW = "v_dashboard_communes"
 HIST_VIEW = "v_dashboard_communes_historique"
 
-SCORE_COLS = ["score_prix", "score_demo", "score_infra", "score_foncier", "score_risque", "score_marche"]
-SCORE_LABELS = ["Prix", "Démographie", "Infrastructure", "Foncier", "Risque", "Marché"]
+SCORE_COLS = ["score_marche", "score_prix", "score_demo", "score_mobilite"]
+SCORE_LABELS = ["Marché", "Prix/Accessibilité", "Démographie", "Mobilité"]
 
 
 @st.cache_data(ttl=3600, show_spinner=False)
@@ -86,7 +90,7 @@ num_cols = [
     "taux_chomage_pct", "pct_proprietaires", "age_median", "pct_diplome_superieur",
     "score_total", *SCORE_COLS, "capacite_emprunt_20ans", "revenu_median_menage",
     "prix_median_maison", "nb_transactions_recent", "ratio_capacite_prix_pct",
-    "densite_logha_existante", "score_potentiel_developpement", "vitesse_jours",
+    "anciennete_active_jours", "n_annonces_actives",
     "distance_gare_km", "centroid_lat", "centroid_lng",
 ]
 for c in num_cols:
@@ -111,9 +115,42 @@ st.caption(
     "⚠️ Couverture partielle sur certains champs : ratio capacité/prix "
     f"({df['ratio_capacite_prix_pct'].notna().sum()}/{len(df)}), "
     f"densité ({df['densite_hab_km2'].notna().sum()}/{len(df)}), "
-    f"vitesse de vente ({df['vitesse_jours'].notna().sum()}/{len(df)}). "
+    f"ancienneté active ({df['anciennete_active_jours'].notna().sum()}/{len(df)}). "
     "Les cases vides ('n.c.') ne sont pas des zéros."
 )
+
+with st.expander("ℹ️ Comment chaque chiffre est calculé — pas de boîte noire", expanded=False):
+    st.markdown("""
+**Scoring reconstruit le 13/09/2026.** L'ancien score (`communes_score_investissement`, 6 sous-scores)
+a été **abandonné** : aucune formule documentée n'a été retrouvée nulle part (ni dans le vault,
+ni dans la base — c'est une table figée, pas une vue qu'on peut inspecter). Plutôt que de garder
+une boîte noire, il a été remplacé par 4 piliers dont la formule exacte suit — vérifiable dans
+la vue SQL `v_dashboard_communes`.
+
+| Pilier (0-20 pts) | Formule exacte |
+|---|---|
+| **Marché** | 60% × ancienneté active (20 pts si annonces neuves, 0 pt si ≥180 j. en moyenne) + 40% × volume de transactions/an (20 pts si ≥200/an) |
+| **Prix / Accessibilité** | 20 × min(capacité d'emprunt ÷ prix médian maison, 100%) ÷ 100 |
+| **Démographie** | 10 × (rang percentile du revenu médian) + 10 × (rang percentile inverse du chômage) — position relative parmi les 339 communes, pas une valeur absolue |
+| **Mobilité** | 20 pts si gare à 0 km, 0 pt si ≥15 km (linéaire, à vol d'oiseau) |
+| **Score global** | (somme des 4 piliers) × 1,25 → ramené sur 100. Une donnée manquante est neutralisée à 10/20 (médiane), jamais à 0. |
+
+**Ancienneté active (jours)** — ⚠️ ce n'est **pas** un temps de vente :
+> Moyenne (aujourd'hui − date de première détection) sur les annonces **actives** de la commune. C'est le temps déjà passé sur le marché pour le stock non vendu — pas la durée réelle avant vente.
+> **Pourquoi pas un vrai "temps pour vendre" :** vérifié en base — le champ censé capter la sortie du marché (`date_disparition`) est vide à 100%, et la seule alternative disponible donne une durée médiane de **0 jour** sur les biens vendus, ce qui est incohérent. Cette donnée n'est tout simplement pas mesurable fiablement avec le pipeline de collecte actuel.
+> Couverture : jointure sur le nom de commune normalisé (pas `code_ins`, vide sur 98% de la table) → 98% des communes calculables, contre 2% avec l'ancienne méthode. Communes avec moins de 5 annonces actives : non calculé (`n.c.`).
+
+**Chiffres 100% expliqués (pas de scoring, données ou calculs directs) :**
+
+| Indicateur | Formule / source |
+|---|---|
+| Capacité d'achat / prix | `capacite_emprunt_20ans` (Statbel + hypothèses bancaires) ÷ prix médian maison le plus récent × 100 |
+| Densité (hab/km²) | Population totale (Statbel 2021) ÷ superficie de la commune |
+| Groupe de pairs | Croisement population (5 bandes) × densité (3 bandes) |
+| Rangs (pairs/province/région) | Classement du Score global dans chaque périmètre |
+| Tendance passée | Prix médian trimestriel Statbel, 2020-2025 — donnée brute |
+| Revenu, chômage, % propriétaires | Statbel, tels quels |
+""")
 
 # ---------------------------------------------------------------- sélection
 
@@ -133,30 +170,39 @@ with c1:
     st.caption(f"Groupe de pairs : **{row['groupe_pairs']}** ({int(row['n_pairs'])} communes comparables)")
 
     k1, k2, k3 = st.columns(3)
-    k1.metric("Score global", f"{row['score_total']:.0f}" if pd.notna(row["score_total"]) else "n.c.")
+    k1.metric("Score global", f"{row['score_total']:.0f}" if pd.notna(row["score_total"]) else "n.c.",
+              help="(Marché + Prix + Démographie + Mobilité) × 1,25, ramené sur 100. Formule complète dans l'encadré ci-dessus.")
     k2.metric("Capacité d'achat / prix", f"{row['ratio_capacite_prix_pct']:.0f} %" if pd.notna(row["ratio_capacite_prix_pct"]) else "n.c.",
-              help="Capacité d'emprunt du ménage médian ÷ prix médian maison. Bas = les locaux ne peuvent plus suivre le prix du marché.")
-    k3.metric("Vitesse de vente", f"{row['vitesse_jours']:.0f} j." if pd.notna(row["vitesse_jours"]) else "n.c.")
+              help="Capacité d'emprunt du ménage médian (20 ans) ÷ prix médian maison le plus récent × 100. Bas = les locaux ne peuvent plus suivre le prix du marché.")
+    k3.metric(
+        "Ancienneté active",
+        f"{row['anciennete_active_jours']:.0f} j." if pd.notna(row["anciennete_active_jours"]) else "n.c. (< 5 annonces exploitables)",
+        help="Temps moyen déjà passé sur le marché pour les annonces actives (pas un temps de vente — voir encadré ci-dessus pour pourquoi). "
+             + (f"Basé sur {int(row['n_annonces_actives'])} annonces." if pd.notna(row.get("n_annonces_actives")) else ""),
+    )
 
     r1, r2, r3 = st.columns(3)
-    r1.metric("Rang / groupe de pairs", f"{int(row['rang_pairs'])}/{int(row['n_pairs'])}" if pd.notna(row["rang_pairs"]) else "n.c.")
-    r2.metric("Rang / province", f"{int(row['rang_province'])}/{int(row['n_province'])}" if pd.notna(row["rang_province"]) else "n.c.")
-    r3.metric("Rang / Wallonie+BXL", f"{int(row['rang_general'])}/{int(row['n_general'])}" if pd.notna(row["rang_general"]) else "n.c.")
+    r1.metric("Rang / groupe de pairs", f"{int(row['rang_pairs'])}/{int(row['n_pairs'])}" if pd.notna(row["rang_pairs"]) else "n.c.",
+              help="Rang du Score global parmi les communes du même groupe de pairs (population × densité).")
+    r2.metric("Rang / province", f"{int(row['rang_province'])}/{int(row['n_province'])}" if pd.notna(row["rang_province"]) else "n.c.",
+              help="Rang du Score global parmi toutes les communes de la même province.")
+    r3.metric("Rang / Wallonie+BXL", f"{int(row['rang_general'])}/{int(row['n_general'])}" if pd.notna(row["rang_general"]) else "n.c.",
+              help="Rang du Score global sur l'ensemble des 339 communes couvertes.")
 
-    st.markdown("**Démographie**")
+    st.markdown("**Démographie** (Statbel, brut)")
     d1, d2, d3 = st.columns(3)
     d1.metric("Revenu médian net", f"{row['revenu_median_net']:,.0f} €".replace(",", " ") if pd.notna(row["revenu_median_net"]) else "n.c.")
     d2.metric("Taux de chômage", f"{row['taux_chomage_pct']:.1f} %" if pd.notna(row["taux_chomage_pct"]) else "n.c.")
     d3.metric("% propriétaires", f"{row['pct_proprietaires']:.0f} %" if pd.notna(row["pct_proprietaires"]) else "n.c.")
 
 with c2:
-    st.subheader("Radar multi-critères")
-    vals = [row[c] if pd.notna(row[c]) else 0 for c in SCORE_COLS]
+    st.subheader("Radar — 4 piliers")
+    vals = [row[c] if pd.notna(row[c]) else 10 for c in SCORE_COLS]
     fig = go.Figure()
     fig.add_trace(go.Scatterpolar(r=vals, theta=SCORE_LABELS, fill="toself", name=row["nom_commune"]))
     fig.update_layout(polar=dict(radialaxis=dict(visible=True, range=[0, 20])), showlegend=False, height=340, margin=dict(l=30, r=30, t=20, b=20))
     st.plotly_chart(fig, use_container_width=True)
-    st.caption("Échelle 0-20 par sous-score (source : `communes_score_investissement`).")
+    st.caption("Échelle 0-20 par pilier — formule exacte de chacun dans l'encadré 'Comment chaque chiffre est calculé' en haut de page.")
 
 st.markdown("---")
 
@@ -171,7 +217,7 @@ if not h.empty:
     fig = px.line(h, x="periode", y="prix_median", color="type_bien", markers=True)
     fig.update_layout(height=320, margin=dict(l=10, r=10, t=10, b=10), xaxis_title="", yaxis_title="Prix médian (€)")
     st.plotly_chart(fig, use_container_width=True)
-    st.caption("Source : Statbel, prix médian trimestriel par type de bien (2020-2025).")
+    st.caption("Source : Statbel, prix médian trimestriel par type de bien (2020-2025) — donnée brute, aucun calcul.")
 else:
     st.info("Pas d'historique de prix disponible pour cette commune.")
 
@@ -183,11 +229,11 @@ st.subheader("⚖️ Comparateur — groupe de pairs")
 peers = df[df["groupe_pairs"] == row["groupe_pairs"]].sort_values("score_total", ascending=False)
 peers_table = peers[[
     "nom_commune", "nom_province", "population_totale", "score_total", "ratio_capacite_prix_pct",
-    "vitesse_jours", "prix_median_maison", "taux_chomage_pct",
+    "anciennete_active_jours", "prix_median_maison", "taux_chomage_pct",
 ]].rename(columns={
     "nom_commune": "Commune", "nom_province": "Province", "population_totale": "Population",
     "score_total": "Score", "ratio_capacite_prix_pct": "Capacité/prix (%)",
-    "vitesse_jours": "Vitesse (j.)", "prix_median_maison": "Prix médian maison (€)",
+    "anciennete_active_jours": "Ancienneté active (j.)", "prix_median_maison": "Prix médian maison (€)",
     "taux_chomage_pct": "Chômage (%)",
 })
 st.dataframe(
@@ -196,7 +242,7 @@ st.dataframe(
         "Population": st.column_config.NumberColumn(format="%d"),
         "Score": st.column_config.NumberColumn(format="%.0f"),
         "Capacité/prix (%)": st.column_config.NumberColumn(format="%.1f %%"),
-        "Vitesse (j.)": st.column_config.NumberColumn(format="%.0f"),
+        "Ancienneté active (j.)": st.column_config.NumberColumn(format="%.0f"),
         "Chômage (%)": st.column_config.NumberColumn(format="%.1f %%"),
         "Prix médian maison (€)": st.column_config.NumberColumn(format="%d €"),
     },
@@ -240,18 +286,19 @@ full = df if prov_filter == "Toutes" else df[df["nom_province"] == prov_filter]
 full = full.sort_values("score_total", ascending=False)
 full_table = full[[
     "nom_commune", "nom_province", "groupe_pairs", "score_total", "ratio_capacite_prix_pct",
-    "vitesse_jours", "taux_chomage_pct", "prix_median_maison",
+    "anciennete_active_jours", "taux_chomage_pct", "prix_median_maison",
 ]].rename(columns={
     "nom_commune": "Commune", "nom_province": "Province", "groupe_pairs": "Groupe de pairs",
     "score_total": "Score", "ratio_capacite_prix_pct": "Capacité/prix (%)",
-    "vitesse_jours": "Vitesse (j.)", "taux_chomage_pct": "Chômage (%)", "prix_median_maison": "Prix médian maison (€)",
+    "anciennete_active_jours": "Ancienneté active (j.)", "taux_chomage_pct": "Chômage (%)",
+    "prix_median_maison": "Prix médian maison (€)",
 })
 st.dataframe(
     full_table, use_container_width=True, height=420, hide_index=True,
     column_config={
         "Score": st.column_config.NumberColumn(format="%.0f"),
         "Capacité/prix (%)": st.column_config.NumberColumn(format="%.1f %%"),
-        "Vitesse (j.)": st.column_config.NumberColumn(format="%.0f"),
+        "Ancienneté active (j.)": st.column_config.NumberColumn(format="%.0f"),
         "Chômage (%)": st.column_config.NumberColumn(format="%.1f %%"),
         "Prix médian maison (€)": st.column_config.NumberColumn(format="%d €"),
     },
