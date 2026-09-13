@@ -109,6 +109,7 @@ num_cols = [
     "distance_zone_houillere_km",
     "nb_entreprises_bep", "nb_entreprises_idelux", "nb_entreprises_idea",
     "nb_emploi_idea", "superficie_disponible_idea_m2",
+    "temps_bruxelles_min", "temps_charleroi_min", "temps_mons_min", "temps_liege_min", "temps_namur_min",
 ]
 for c in num_cols:
     if c in df.columns:
@@ -174,6 +175,7 @@ la vue SQL `v_dashboard_communes`.
 | Projets UE (Kohesio) | 3 888 projets européens belges (2014-2020, FEDER/FSE) téléchargés depuis `cohesiondata.ec.europa.eu` (dataset officiel), rattachés à la commune la plus proche par distance au centroïde (seuil 15 km, pour exclure les projets flamands). **Approximatif** : pas un géocodage à l'adresse, une commune rurale étendue peut absorber un projet en réalité situé dans une commune voisine plus petite. 2 364/3 888 projets rattachés (les autres : hors zone ou >15 km, essentiellement flamands). Aucune donnée 2021-2027 disponible au niveau projet à ce jour. |
 | Risque minier | Distance du centroïde communal à la concession minière de houille ou zone déhouillée (Bassin de Mons) la plus proche — couche officielle SPW (`geoservices.wallonie.be`, service WFS INSPIRE), 157 polygones houille/déhouillées filtrés sur 360 concessions minières wallonnes (métal, fer, or, houille...). **Approximatif** : distance au centroïde communal, pas une vérification à la parcelle — une commune peut avoir 0 km affiché alors qu'une adresse précise est loin de la zone réelle, ou l'inverse. 40/283 communes ont leur centroïde dans une zone. Non stocké en géométrie brute dans Supabase (cohérent avec l'architecture 3 niveaux du plan) — seule la distance calculée est conservée. |
 | Parcs d'activité économique | Comptage d'entreprises sur les parcs économiques : IDEA (Hainaut/Mons-Borinage, avec emplois et surface disponible par parc — source `odwb.be`), BEP (Namur), IDELUX (Luxembourg). SPI (Liège) : pas de source en open data trouvée. **Snapshot statique** — aucune des 3 sources ne publie de date d'implantation, donc pas un signal "investissements récents" à proprement parler, juste "présence économique actuelle". Matching commune fait par nom de localité (accents normalisés + table de correspondance village→commune post-fusion 1977) — 94-100% de taux de correspondance selon la source, le résidu (localités rares/mal orthographiées) n'est pas comptabilisé plutôt que mal attribué. |
+| Temps de trajet réel | Temps de trajet voiture (routage réel, pas à vol d'oiseau) du centroïde communal vers Bruxelles/Charleroi/Mons/Liège/Namur — calculé via Valhalla (moteur de routage open-source, tuiles OpenStreetMap Belgique), déployé en Docker sur le serveur (calcul fait une fois pour les 283 communes, pas un appel live à chaque chargement de page). 281/283 communes calculées (2 non routables au centroïde exact). Remplace la logique "distance à vol d'oiseau" utilisée pour la gare la plus proche, mais ne remplace pas le score Mobilité actuel (qui reste basé sur la gare) — purement indicatif pour l'instant. |
 
 **Table écartée après vérification :** `communes_fiscalite_immo` — les taux d'enregistrement et le précompte sont vides à 100%, et le "coefficient additionnel communal" affiché comme rempli est en réalité **une valeur constante (2600) sur les 338 communes** — une donnée placeholder, pas une vraie donnée fiscale locale. Non utilisée.
 """)
@@ -264,6 +266,22 @@ with c1:
         emploi = row.get("nb_emploi_idea")
         p2.metric("Emplois estimés (IDEA)", f"{int(emploi)}" if pd.notna(emploi) and emploi else "n.c.",
                   help="Emplois recensés sur les parcs IDEA de la commune (donnée non disponible pour BEP/IDELUX dans cette source).")
+
+    st.markdown("**🚗 Temps de trajet réel** (hors score — indicatif, ajouté le 13/09)")
+    hubs = [("Bruxelles", "temps_bruxelles_min"), ("Charleroi", "temps_charleroi_min"), ("Mons", "temps_mons_min"), ("Liège", "temps_liege_min"), ("Namur", "temps_namur_min")]
+    t_cols = st.columns(5)
+    any_temps = False
+    for col, (label, field) in zip(t_cols, hubs):
+        val = row.get(field)
+        if pd.notna(val):
+            any_temps = True
+            col.metric(label, f"{val:.0f} min")
+        else:
+            col.metric(label, "n.c.")
+    if any_temps:
+        st.caption("Temps de trajet voiture réel (Valhalla, routage OSM), pas une distance à vol d'oiseau — calculé une fois depuis un service déployé sur serveur, pas un appel live.")
+    else:
+        st.caption("Pas de temps de trajet disponible pour cette commune (point non routable au centroïde).")
 
 with c2:
     st.subheader("Radar — 4 piliers")
