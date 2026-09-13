@@ -14,6 +14,7 @@ import time
 from datetime import datetime
 from pathlib import Path
 
+import numpy as np
 import pandas as pd
 import plotly.express as px
 import requests
@@ -138,7 +139,10 @@ def compute_mdb_scores(
     ARV comparé sur des ANNONCES (prix demandés, pas des ventes réelles) —
     limite connue, à améliorer en branchant `transactions_spf_wallonie`.
     """
-    comp_base = df_all[df_all["peb"].isin(PEB_RENOVES)]
+    # ⚠️ Comparables et scope limités à la VENTE — un loyer mensuel (ex. 2100 €)
+    # traité comme un prix d'achat produirait un prix/m² comparable délirant et
+    # fausserait l'ARV même pour les biens à vendre analysés en même temps.
+    comp_base = df_all[df_all["peb"].isin(PEB_RENOVES) & (df_all["type_transaction"] == "vente")]
     comp_commune = comp_base.groupby("commune_norm")["prix_m2"].median()
     comp_region = comp_base.groupby("region")["prix_m2"].median()
     comp_commune_n = comp_base.groupby("commune_norm")["prix_m2"].count()
@@ -152,7 +156,8 @@ def compute_mdb_scores(
         | (df_scope["type_bien"].eq("maison") & df_scope["surface_habitable"].between(25, 600))
     )
     d = df_scope[
-        df_scope["type_bien"].isin(["maison", "appartement"])
+        (df_scope["type_transaction"] == "vente")
+        & df_scope["type_bien"].isin(["maison", "appartement"])
         & df_scope["peb"].isin(peb_cibles)
         & df_scope["prix"].notna()
         & surface_ok
@@ -198,6 +203,103 @@ def statut_mdb(marge_pct, seuil_go_fort, seuil_go, seuil_limite):
     if marge_pct >= seuil_limite:
         return "⚪ Limite"
     return "⬛ Écarté"
+
+
+# ---------------------------------------------------------------- score colocation
+# Formule reprise telle quelle de pipeline/Score-colocation-formula.md (vault Moubri,
+# v1.0 2026-06-08) — jamais reliée à rien jusqu'ici. Points de référence (universités,
+# pôles d'emploi) fixés à la main sur des coordonnées de campus/centres-villes connus —
+# approximatif à l'échelle de la commune, pas une donnée mesurée.
+
+UNIVERSITES = [
+    ("UMONS", 50.454, 3.956), ("ULB", 50.8136, 4.3805), ("VUB", 50.8221, 4.3958),
+    ("ULiège", 50.6326, 5.5797), ("UCLouvain", 50.6683, 4.6114),
+    ("UNamur", 50.4653, 4.8657), ("UCLouvain Charleroi", 50.4108, 4.4446),
+    ("Tournai (FUCaM/HE)", 50.6053, 3.3888), ("ULiège Arlon", 49.6833, 5.8167),
+]
+POLES_EMPLOI = [
+    ("Bruxelles", 50.8503, 4.3517), ("Namur", 50.4674, 4.8718), ("Liège", 50.6326, 5.5797),
+    ("Charleroi", 50.4108, 4.4446), ("Mons", 50.4542, 3.9523), ("Tournai", 50.6053, 3.3888),
+    ("Arlon", 49.6833, 5.8167), ("Wavre", 50.7167, 4.6000), ("La Louvière", 50.4667, 4.1833),
+]
+
+
+def _score_band(val, bands):
+    """bands: liste de (seuil_max, score), triée croissant ; dernier = au-delà."""
+    for seuil, score in bands[:-1]:
+        if val <= seuil:
+            return score
+    return bands[-1][1]
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def fetch_reference(view_name, select):
+    url, key = get_credentials()
+    headers = {"apikey": key, "Authorization": f"Bearer {key}"}
+    r = requests.get(f"{url}/rest/v1/{view_name}", headers=headers, params={"select": select, "limit": 2000}, timeout=30)
+    r.raise_for_status()
+    return pd.DataFrame(r.json())
+
+
+def compute_colocation_scores(df_scope):
+    """Score colocation par annonce (location uniquement), formule vault v1.0.
+    Le veto 'électricité non conforme' du document original N'EST PAS calculable
+    depuis les annonces — jamais appliqué automatiquement, à vérifier en visite."""
+    d = df_scope[
+        (df_scope["type_transaction"] == "location")
+        & df_scope["lat"].notna() & df_scope["lng"].notna()
+        & df_scope["type_bien"].isin(["maison", "appartement"])
+    ].copy()
+    if d.empty:
+        return d
+
+    communes_ref = fetch_reference("v_dashboard_communes", "code_ins,nom_commune,densite_hab_km2,distance_gare_km")
+    loyers_ref = fetch_reference("v_dashboard_loyers", "code_ins,type_bien,loyer_median")
+    communes_ref["commune_norm"] = communes_ref["nom_commune"].str.strip().str.upper()
+    d["commune_norm"] = d["commune"].str.strip().str.upper()
+    d = d.merge(communes_ref[["commune_norm", "code_ins", "densite_hab_km2", "distance_gare_km"]], on="commune_norm", how="left")
+    d = d.merge(loyers_ref, on=["code_ins", "type_bien"], how="left")
+
+    def nearest(lat, lng, points):
+        plat = np.array([p[1] for p in points])
+        plng = np.array([p[2] for p in points])
+        lat_v = lat.to_numpy()[:, None]
+        lng_v = lng.to_numpy()[:, None]
+        dd = 111.111 * np.sqrt((lat_v - plat[None, :]) ** 2 + ((lng_v - plng[None, :]) * np.cos(np.radians(lat_v))) ** 2)
+        return dd.min(axis=1)
+
+    d["dist_universite_km"] = nearest(d["lat"], d["lng"], UNIVERSITES)
+    d["dist_emploi_km"] = nearest(d["lat"], d["lng"], POLES_EMPLOI)
+
+    d["s_uni"] = d["dist_universite_km"].apply(lambda v: _score_band(v, [(10, 10), (20, 7), (40, 4), (999, 1)]))
+    d["s_emploi"] = d["dist_emploi_km"].apply(lambda v: _score_band(v, [(5, 10), (15, 7), (30, 4), (999, 1)]))
+    d["s_transport"] = d["distance_gare_km"].apply(lambda v: _score_band(v, [(1, 10), (3, 8), (6, 6), (15, 4), (999, 1)]) if pd.notna(v) else 5)
+    d["s_densite"] = d["densite_hab_km2"].apply(lambda v: _score_band(v, [(1000, 2), (5000, 5), (10000, 8), (999999, 10)]) if pd.notna(v) else 5)
+    d["s_chambres"] = d["nb_chambres"].apply(lambda v: _score_band(v, [(1, 1), (2, 4), (3, 7), (99, 10)]) if pd.notna(v) else 4)
+    d["s_loyer"] = d["loyer_median"].apply(lambda v: _score_band(v, [(400, 10), (600, 7), (900, 4), (999999, 1)]) if pd.notna(v) else 5)
+
+    d["score_brut"] = (
+        25 * d["s_uni"] + 20 * d["s_emploi"] + 15 * d["s_transport"]
+        + 15 * d["s_densite"] + 15 * d["s_chambres"] + 10 * d["s_loyer"]
+    ) / 100
+
+    d["score_coloc"] = d["score_brut"]
+    d.loc[d["dist_universite_km"] <= 15, "score_coloc"] += 2
+    d.loc[(d["densite_hab_km2"] > 5000), "score_coloc"] += 1
+    d.loc[(d["densite_hab_km2"] < 500) & (d["dist_emploi_km"] > 40), "score_coloc"] -= 1
+    d["score_coloc"] = d["score_coloc"].clip(1, 10).round(1)
+
+    def verdict(s):
+        if s >= 7:
+            return "🟢 Excellente"
+        if s >= 5:
+            return "🟡 Viable"
+        if s >= 3:
+            return "🟠 Location entière préférable"
+        return "🔴 Impossible"
+
+    d["verdict_coloc"] = d["score_coloc"].apply(verdict)
+    return d
 
 
 def load_last_filters():
@@ -328,67 +430,114 @@ st.markdown("---")
 
 # ---------------------------------------------------------------- analyse MdB
 
-st.subheader("🎯 Meilleures opportunités — achat dégradé → rénovation → revente")
-st.caption(
-    "Marge = ARV brut − prix − enregistrement − travaux − portage/financement − frais de revente"
-    + (" − ISOC" if appliquer_isoc else "") + ". "
-    "ARV comparé sur des **annonces** PEB A-B du secteur (prix demandés, pas des ventes réelles — "
-    "sous-estime probablement la fiabilité). **Un tri pour prioriser les visites, jamais une offre.**"
-)
-
-mdb = compute_mdb_scores(
-    f, df, peb_cibles, taux_enregistrement_pct, cout_travaux_m2,
-    frais_vente_pct, taux_financier_annuel_pct, duree_portage_mois, appliquer_isoc, isoc_pct,
-)
-
-if mdb.empty:
-    st.info("Aucun bien PEB " + "/".join(peb_cibles) + " (maison ou appartement) dans la sélection actuelle.")
-else:
-    mdb["statut"] = mdb["marge_pct"].apply(lambda m: statut_mdb(m, seuil_go_fort, seuil_go, seuil_limite))
-    mdb = mdb.sort_values("marge_pct", ascending=False)
-
-    m1, m2, m3, m4 = st.columns(4)
-    m1.metric("🔴 GO fort", int((mdb["statut"] == "🔴 GO fort").sum()))
-    m2.metric("🟡 GO", int((mdb["statut"] == "🟡 GO").sum()))
-    m3.metric("⚪ Limite", int((mdb["statut"] == "⚪ Limite").sum()))
-    go_df = mdb[mdb["statut"].isin(["🔴 GO fort", "🟡 GO"])]
-    m4.metric("Marge médiane (GO)", f"{go_df['marge_pct'].median():.0f} %" if not go_df.empty else "—")
-
-    low_n = int((mdb["n_comparables"] < 5).sum())
-    if low_n:
-        st.caption(f"⚠️ {low_n} biens notés avec un comparable de secours au niveau région (moins de 5 annonces PEB A-B trouvées dans leur commune) — marge moins fiable pour ceux-là, colonne « Comparable ».")
-
-    show = mdb[mdb["statut"] != "⬛ Écarté"].head(200)
-    top_table = show[
-        ["statut", "commune", "code_postal", "prix", "peb", "surface_habitable", "nb_chambres",
-         "jours_sur_marche", "arv_brut", "cout_travaux", "cout_financier", "cout_vente",
-         "marge_pct", "comparable_source", "n_comparables", "url_principale"]
-    ].rename(columns={
-        "statut": "Statut", "commune": "Commune", "code_postal": "CP", "prix": "Prix (€)",
-        "peb": "PEB", "surface_habitable": "Surface (m²)", "nb_chambres": "Ch.",
-        "jours_sur_marche": "Jours en ligne", "arv_brut": "ARV brut (€)",
-        "cout_travaux": "Travaux (€)", "cout_financier": "Portage (€)", "cout_vente": "Frais revente (€)",
-        "marge_pct": "Marge %", "comparable_source": "Comparable", "n_comparables": "N comp.",
-        "url_principale": "Annonce",
-    })
-    st.dataframe(
-        top_table,
-        use_container_width=True,
-        height=420,
-        hide_index=True,
-        column_config={
-            "Annonce": st.column_config.LinkColumn("Annonce", display_text="Voir ↗"),
-            "Marge %": st.column_config.NumberColumn("Marge %", format="%.0f %%"),
-            "Prix (€)": st.column_config.NumberColumn("Prix (€)", format="%d €"),
-            "ARV brut (€)": st.column_config.NumberColumn("ARV brut (€)", format="%d €"),
-            "Travaux (€)": st.column_config.NumberColumn("Travaux (€)", format="%d €"),
-            "Portage (€)": st.column_config.NumberColumn("Portage (€)", format="%d €"),
-            "Frais revente (€)": st.column_config.NumberColumn("Frais revente (€)", format="%d €"),
-        },
+if transaction == "vente":
+    st.subheader("🎯 Meilleures opportunités — achat dégradé → rénovation → revente")
+    st.caption(
+        "Marge = ARV brut − prix − enregistrement − travaux − portage/financement − frais de revente"
+        + (" − ISOC" if appliquer_isoc else "") + ". "
+        "ARV comparé sur des **annonces de vente** PEB A-B du secteur (prix demandés, pas des ventes réelles — "
+        "sous-estime probablement la fiabilité). **Un tri pour prioriser les visites, jamais une offre.**"
     )
-    st.caption(f"{len(mdb) - len(show)} biens supplémentaires écartés ou hors du top 200 (ajustez les filtres pour affiner).")
+
+    mdb = compute_mdb_scores(
+        f, df, peb_cibles, taux_enregistrement_pct, cout_travaux_m2,
+        frais_vente_pct, taux_financier_annuel_pct, duree_portage_mois, appliquer_isoc, isoc_pct,
+    )
+
+    if mdb.empty:
+        st.info("Aucun bien PEB " + "/".join(peb_cibles) + " (maison ou appartement) dans la sélection actuelle.")
+    else:
+        mdb["statut"] = mdb["marge_pct"].apply(lambda m: statut_mdb(m, seuil_go_fort, seuil_go, seuil_limite))
+        mdb = mdb.sort_values("marge_pct", ascending=False)
+
+        m1, m2, m3, m4 = st.columns(4)
+        m1.metric("🔴 GO fort", int((mdb["statut"] == "🔴 GO fort").sum()))
+        m2.metric("🟡 GO", int((mdb["statut"] == "🟡 GO").sum()))
+        m3.metric("⚪ Limite", int((mdb["statut"] == "⚪ Limite").sum()))
+        go_df = mdb[mdb["statut"].isin(["🔴 GO fort", "🟡 GO"])]
+        m4.metric("Marge médiane (GO)", f"{go_df['marge_pct'].median():.0f} %" if not go_df.empty else "—")
+
+        low_n = int((mdb["n_comparables"] < 5).sum())
+        if low_n:
+            st.caption(f"⚠️ {low_n} biens notés avec un comparable de secours au niveau région (moins de 5 annonces PEB A-B trouvées dans leur commune) — marge moins fiable pour ceux-là, colonne « Comparable ».")
+
+        show = mdb[mdb["statut"] != "⬛ Écarté"].head(200)
+        top_table = show[
+            ["statut", "commune", "code_postal", "prix", "peb", "surface_habitable", "nb_chambres",
+             "jours_sur_marche", "arv_brut", "cout_travaux", "cout_financier", "cout_vente",
+             "marge_pct", "comparable_source", "n_comparables", "url_principale"]
+        ].rename(columns={
+            "statut": "Statut", "commune": "Commune", "code_postal": "CP", "prix": "Prix (€)",
+            "peb": "PEB", "surface_habitable": "Surface (m²)", "nb_chambres": "Ch.",
+            "jours_sur_marche": "Jours en ligne", "arv_brut": "ARV brut (€)",
+            "cout_travaux": "Travaux (€)", "cout_financier": "Portage (€)", "cout_vente": "Frais revente (€)",
+            "marge_pct": "Marge %", "comparable_source": "Comparable", "n_comparables": "N comp.",
+            "url_principale": "Annonce",
+        })
+        st.dataframe(
+            top_table,
+            use_container_width=True,
+            height=420,
+            hide_index=True,
+            column_config={
+                "Annonce": st.column_config.LinkColumn("Annonce", display_text="Voir ↗"),
+                "Marge %": st.column_config.NumberColumn("Marge %", format="%.0f %%"),
+                "Prix (€)": st.column_config.NumberColumn("Prix (€)", format="%d €"),
+                "ARV brut (€)": st.column_config.NumberColumn("ARV brut (€)", format="%d €"),
+                "Travaux (€)": st.column_config.NumberColumn("Travaux (€)", format="%d €"),
+                "Portage (€)": st.column_config.NumberColumn("Portage (€)", format="%d €"),
+                "Frais revente (€)": st.column_config.NumberColumn("Frais revente (€)", format="%d €"),
+            },
+        )
+        st.caption(f"{len(mdb) - len(show)} biens supplémentaires écartés ou hors du top 200 (ajustez les filtres pour affiner).")
 
 st.markdown("---")
+
+# ---------------------------------------------------------------- score colocation
+
+if transaction == "location":
+    st.subheader("🎓 Score colocation")
+    st.caption(
+        "Formule reprise du vault Moubri (`pipeline/Score-colocation-formula.md`, v1.0) : "
+        "25% distance université + 20% distance pôle d'emploi + 15% transport (proxy : distance gare la plus proche) "
+        "+ 15% densité de population (commune) + 15% nombre de chambres + 10% loyer médian du secteur, sur 10. "
+        "Bonus/malus : +2 si université ≤15km, +1 si densité >5000 hab/km², −1 si rural ET emploi >40km. "
+        "**Le veto \"électricité non conforme\" du document original n'est pas calculable depuis les annonces — à vérifier impérativement en visite, jamais automatique.**"
+    )
+    with st.spinner("Calcul du score colocation..."):
+        coloc = compute_colocation_scores(f)
+    if coloc.empty:
+        st.info("Aucune annonce de location (maison/appartement) géolocalisée dans la sélection actuelle.")
+    else:
+        coloc = coloc.sort_values("score_coloc", ascending=False)
+        cc1, cc2, cc3 = st.columns(3)
+        cc1.metric("🟢 Excellente", int((coloc["verdict_coloc"] == "🟢 Excellente").sum()))
+        cc2.metric("🟡 Viable", int((coloc["verdict_coloc"] == "🟡 Viable").sum()))
+        cc3.metric("Score médian", f"{coloc['score_coloc'].median():.1f}/10")
+
+        coloc_table = coloc.head(200)[[
+            "verdict_coloc", "commune", "code_postal", "prix", "nb_chambres",
+            "dist_universite_km", "dist_emploi_km", "distance_gare_km", "loyer_median",
+            "score_coloc", "url_principale",
+        ]].rename(columns={
+            "verdict_coloc": "Verdict", "commune": "Commune", "code_postal": "CP", "prix": "Loyer (€)",
+            "nb_chambres": "Ch.", "dist_universite_km": "Dist. univ. (km)", "dist_emploi_km": "Dist. emploi (km)",
+            "distance_gare_km": "Dist. gare (km)", "loyer_median": "Loyer médian secteur (€)",
+            "score_coloc": "Score /10", "url_principale": "Annonce",
+        })
+        st.dataframe(
+            coloc_table, use_container_width=True, height=420, hide_index=True,
+            column_config={
+                "Annonce": st.column_config.LinkColumn("Annonce", display_text="Voir ↗"),
+                "Score /10": st.column_config.NumberColumn(format="%.1f"),
+                "Dist. univ. (km)": st.column_config.NumberColumn(format="%.0f"),
+                "Dist. emploi (km)": st.column_config.NumberColumn(format="%.0f"),
+                "Dist. gare (km)": st.column_config.NumberColumn(format="%.0f"),
+                "Loyer médian secteur (€)": st.column_config.NumberColumn(format="%d €"),
+                "Loyer (€)": st.column_config.NumberColumn(format="%d €"),
+            },
+        )
+    st.markdown("---")
 
 # ---------------------------------------------------------------- charts
 
