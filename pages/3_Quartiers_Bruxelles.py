@@ -2,10 +2,9 @@
 Quartiers Bruxelles — Monitoring des Quartiers (IBSA/perspective.brussels).
 
 Niveau infra-communal pour les 19 communes bruxelloises (145 quartiers).
-Ne couvre PAS la Wallonie (Phase 3 du plan, "IWEPS Walstat + secteurs
-statistiques" — pas encore fait). Ne couvre pas non plus les prix
-immobiliers (cette source n'en publie pas à ce niveau) : uniquement
-démographie/socio-économique.
+Ne couvre PAS la Wallonie (secteurs statistiques Statbel — table
+`ref_secteurs_statistiques`, pas encore branchée au dashboard, couverture
+prix trop faible à ce niveau pour une page dédiée).
 
 Bug trouvé et corrigé le 14/09 : le champ "commune" publié par la source
 (opendata.brussels.be) est faux pour 51/145 quartiers (bug de la source,
@@ -25,16 +24,20 @@ st.set_page_config(page_title="Quartiers Bruxelles — Repérage Immo", page_ico
 
 st.title("🏙️ Quartiers de Bruxelles — Monitoring des Quartiers")
 st.caption(
-    "145 quartiers, 19 communes bruxelloises. Source : IBSA/perspective.brussels — démographie et "
-    "socio-économique uniquement, pas de prix immobilier à ce niveau (source indisponible)."
+    "145 quartiers, 19 communes bruxelloises. Source : IBSA/perspective.brussels — démographie, "
+    "logement, emploi et prix des appartements (là où le nombre de ventes le permet)."
 )
 
 with st.expander("ℹ️ D'où viennent ces chiffres, et une erreur trouvée dans la source"):
     st.markdown("""
-- **Population, densité** : année de référence 2025
-- **Revenu médian, taux de chômage** : année de référence 2023 (dernière disponible)
-- **% propriétaires/locataires** : année de référence 2021
-- **% 65 ans et plus** : année de référence 2025
+| Indicateur | Année de référence |
+|---|---|
+| Population, densité, % 0-17/18-29/18-64/65+ | 2025 |
+| Revenu médian, taux de chômage, chômage jeunes | 2023 |
+| % propriétaires/locataires, % maisons/appartements | 2021 |
+| % logements sociaux | 2024 |
+| % bénéficiaires CPAS | 2022 |
+| Prix médian et nombre de ventes d'appartements | 2023 |
 
 **Erreur trouvée dans la source (corrigée ici) :** le fichier officiel de géométries
 (`opendata.brussels.be`) associe la mauvaise commune à 51 des 145 quartiers — par exemple
@@ -42,9 +45,10 @@ with st.expander("ℹ️ D'où viennent ces chiffres, et une erreur trouvée dan
 corrigé par un vrai test géométrique (le centroïde de chaque quartier est-il dans le polygone
 officiel de quelle commune ?), pas en faisant confiance au champ texte de la source.
 
-**Pas de prix immobilier ici** : contrairement à la page Communes (Wallonie), le Monitoring
-des Quartiers ne publie pas de statistiques de prix. Pour un signal prix à Bruxelles, se référer
-à la page annonces filtrée par commune.
+**Prix immobilier — appartements uniquement** : le Monitoring des Quartiers ne publie pas de
+prix maison à ce niveau (trop peu de ventes pour un secret statistique fiable), et le prix
+appartement lui-même est masqué (`n.c.`) en dessous de 32 ventes/an dans le quartier — 96/145
+quartiers passent ce seuil. Pour un signal maison à Bruxelles, se référer à la page annonces.
 """)
 
 
@@ -64,7 +68,10 @@ if df.empty:
     st.warning("Aucune donnée reçue.")
     st.stop()
 
-num_cols = ["revenu_median", "taux_chomage", "densite_pop", "pct_proprietaires", "pct_locataires", "pct_65_plus", "population", "superficie_m2", "centroid_lat", "centroid_lng"]
+num_cols = ["revenu_median", "taux_chomage", "taux_chomage_jeunes", "densite_pop", "pct_proprietaires",
+            "pct_locataires", "pct_65_plus", "pct_0_17", "pct_18_29", "pct_18_64", "pct_maisons",
+            "pct_appartements", "pct_cpas", "pct_logements_sociaux", "nb_ventes_appart_2023",
+            "prix_median_appart_2023", "population", "superficie_m2", "centroid_lat", "centroid_lng"]
 for c in num_cols:
     df[c] = pd.to_numeric(df[c], errors="coerce")
 
@@ -100,7 +107,28 @@ with c1:
         k4.metric("Taux de chômage", f"{row['taux_chomage']:.1f} %" if pd.notna(row["taux_chomage"]) else "n.c.")
         k5, k6 = st.columns(2)
         k5.metric("% propriétaires", f"{row['pct_proprietaires']:.0f} %" if pd.notna(row["pct_proprietaires"]) else "n.c.")
-        k6.metric("% 65 ans et plus", f"{row['pct_65_plus']:.0f} %" if pd.notna(row["pct_65_plus"]) else "n.c.")
+        k6.metric("% locataires", f"{row['pct_locataires']:.0f} %" if pd.notna(row["pct_locataires"]) else "n.c.")
+
+        st.markdown("**Âge de la population**")
+        a1, a2, a3, a4 = st.columns(4)
+        a1.metric("0-17 ans", f"{row['pct_0_17']:.0f} %" if pd.notna(row["pct_0_17"]) else "n.c.")
+        a2.metric("18-29 ans", f"{row['pct_18_29']:.0f} %" if pd.notna(row["pct_18_29"]) else "n.c.")
+        a3.metric("18-64 ans", f"{row['pct_18_64']:.0f} %" if pd.notna(row["pct_18_64"]) else "n.c.")
+        a4.metric("65 ans et +", f"{row['pct_65_plus']:.0f} %" if pd.notna(row["pct_65_plus"]) else "n.c.")
+
+        st.markdown("**Logement et marché**")
+        l1, l2 = st.columns(2)
+        l1.metric("% maisons / % appartements", f"{row['pct_maisons']:.0f} % / {row['pct_appartements']:.0f} %" if pd.notna(row["pct_maisons"]) else "n.c.")
+        l2.metric("% logements sociaux", f"{row['pct_logements_sociaux']:.1f} %" if pd.notna(row["pct_logements_sociaux"]) else "n.c.")
+        l3, l4 = st.columns(2)
+        l3.metric("Prix médian appartement (2023)", f"{row['prix_median_appart_2023']:,.0f} €".replace(",", " ") if pd.notna(row["prix_median_appart_2023"]) else "n.c. (< 32 ventes/an)",
+                  help="Pas de prix maison publié à ce niveau — trop peu de ventes pour un secret statistique fiable.")
+        l4.metric("Nombre de ventes (2023)", f"{row['nb_ventes_appart_2023']:.0f}" if pd.notna(row["nb_ventes_appart_2023"]) else "n.c.")
+
+        st.markdown("**Emploi et social**")
+        e1, e2 = st.columns(2)
+        e1.metric("Chômage jeunes (18-25)", f"{row['taux_chomage_jeunes']:.1f} %" if pd.notna(row["taux_chomage_jeunes"]) else "n.c.")
+        e2.metric("% bénéficiaires CPAS", f"{row['pct_cpas']:.1f} %" if pd.notna(row["pct_cpas"]) else "n.c.")
 
 with c2:
     st.subheader("🗺️ Carte — revenu médian par quartier")
@@ -129,19 +157,23 @@ with c2:
 st.markdown("---")
 st.subheader("Classement complet")
 table = df.sort_values("revenu_median", ascending=False, na_position="last")[[
-    "nom_quartier", "commune", "population", "revenu_median", "taux_chomage", "pct_proprietaires", "densite_pop"
+    "nom_quartier", "commune", "population", "revenu_median", "prix_median_appart_2023",
+    "taux_chomage", "pct_proprietaires", "pct_logements_sociaux", "densite_pop"
 ]].rename(columns={
     "nom_quartier": "Quartier", "commune": "Commune", "population": "Population",
-    "revenu_median": "Revenu médian (€)", "taux_chomage": "Chômage (%)",
-    "pct_proprietaires": "Propriétaires (%)", "densite_pop": "Densité (hab/km²)",
+    "revenu_median": "Revenu médian (€)", "prix_median_appart_2023": "Prix appart. médian (€, 2023)",
+    "taux_chomage": "Chômage (%)", "pct_proprietaires": "Propriétaires (%)",
+    "pct_logements_sociaux": "Logements sociaux (%)", "densite_pop": "Densité (hab/km²)",
 })
 st.dataframe(
     table, use_container_width=True, height=420, hide_index=True,
     column_config={
         "Population": st.column_config.NumberColumn(format="%d"),
         "Revenu médian (€)": st.column_config.NumberColumn(format="%d €"),
+        "Prix appart. médian (€, 2023)": st.column_config.NumberColumn(format="%d €"),
         "Chômage (%)": st.column_config.NumberColumn(format="%.1f %%"),
         "Propriétaires (%)": st.column_config.NumberColumn(format="%.0f %%"),
+        "Logements sociaux (%)": st.column_config.NumberColumn(format="%.1f %%"),
         "Densité (hab/km²)": st.column_config.NumberColumn(format="%d"),
     },
 )
