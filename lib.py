@@ -33,3 +33,16 @@ def get_credentials():
     url = env.get("SUPABASE_URL")
     key = env.get("SUPABASE_ANON_KEY") or env.get("SUPABASE_KEY")
     return url, key
+
+
+def get_iso_proxy_credentials():
+    """Proxy isochrones (Valhalla + géocodage) sur acolys-serveur.
+    Streamlit Cloud: st.secrets. Local: fallback moubri/.env."""
+    try:
+        has_secrets = "ISO_PROXY_URL" in st.secrets and "ISO_PROXY_KEY" in st.secrets
+    except Exception:
+        has_secrets = False
+    if has_secrets:
+        return st.secrets["ISO_PROXY_URL"], st.secrets["ISO_PROXY_KEY"]
+    env = load_env()
+    return env.get("ISO_PROXY_URL"), env.get("ISO_PROXY_KEY")
