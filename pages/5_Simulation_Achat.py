@@ -25,7 +25,7 @@ import requests
 import streamlit as st
 from streamlit_folium import st_folium
 
-from lib import get_credentials, annuite_facteur, revenu_requis_pour_prix, pct_menages_au_dessus
+from lib import get_credentials, annuite_facteur, revenu_requis_pour_prix, pct_menages_au_dessus, get_indexation_revenu, get_with_retry
 
 st.set_page_config(page_title="Simulation d'achat — Repérage Immo", page_icon="🧮", layout="wide")
 
@@ -45,8 +45,7 @@ def fetch_view(view_name, select="*", params_extra=None):
         params = {"select": select, "limit": page_size, "offset": offset}
         if params_extra:
             params.update(params_extra)
-        r = requests.get(f"{url}/rest/v1/{view_name}", headers=headers, params=params, timeout=60)
-        r.raise_for_status()
+        r = get_with_retry(requests.get, f"{url}/rest/v1/{view_name}", headers, params, timeout=60)
         page = r.json()
         rows.extend(page)
         if len(page) < page_size:
@@ -84,7 +83,7 @@ with st.spinner("Chargement des données..."):
         COMMUNES_VIEW,
         select="code_ins,nom_commune,nom_province,population_totale,prix_median_maison,"
         "revenu_median_menage,capacite_emprunt_20ans,lognormal_mu,lognormal_sigma,"
-        "centroid_lat,centroid_lng",
+        "annee_revenu_menage,centroid_lat,centroid_lng",
     )
     taux_df, _ = fetch_view(TAUX_VIEW)
 
@@ -93,12 +92,24 @@ if communes.empty:
     st.stop()
 
 for c in ["population_totale", "prix_median_maison", "revenu_median_menage",
-          "capacite_emprunt_20ans", "lognormal_mu", "lognormal_sigma"]:
+          "capacite_emprunt_20ans", "lognormal_mu", "lognormal_sigma", "annee_revenu_menage"]:
     communes[c] = pd.to_numeric(communes[c], errors="coerce")
 
 taux_hypo_row = taux_df[taux_df["type_taux"] == "hypothecaire_be_nouveau"]
 taux_defaut = float(taux_hypo_row["valeur"].iloc[0]) if not taux_hypo_row.empty else 3.7
 date_taux = taux_hypo_row["date"].iloc[0] if not taux_hypo_row.empty else None
+
+# --- Indexation du revenu : le revenu ménage (Statbel) a plusieurs années de retard
+# sur le prix immobilier et le taux hypothécaire, tous deux bien plus récents.
+# Les salaires belges sont indexés automatiquement sur l'inflation (index santé) —
+# sans correction, la simulation SOUS-ESTIME la capacité d'achat actuelle.
+annee_revenu_ref = int(communes["annee_revenu_menage"].mode().iloc[0]) if communes["annee_revenu_menage"].notna().any() else None
+facteur_indexation, annee_idx_ref, periode_idx_recente = (1.0, None, None)
+if annee_revenu_ref:
+    facteur_indexation, annee_idx_ref, periode_idx_recente = get_indexation_revenu(annee_revenu_ref)
+
+communes["lognormal_mu_indexe"] = communes["lognormal_mu"] + math.log(facteur_indexation)
+communes["revenu_median_menage_indexe"] = communes["revenu_median_menage"] * facteur_indexation
 
 n_lognormal = communes["lognormal_mu"].notna().sum()
 st.caption(
@@ -107,6 +118,21 @@ st.caption(
     "Taux par défaut : dernier taux hypothécaire moyen réel publié par la BCE "
     f"({taux_defaut:.2f} % au {date_taux}), ajustable ci-dessous."
 )
+if annee_revenu_ref and facteur_indexation != 1.0:
+    st.info(
+        f"📅 **Écart de millésime corrigé** : le revenu des ménages date de **{annee_revenu_ref}** "
+        f"(Statbel), alors que le prix immobilier et le taux sont de 2026 — un vrai écart de "
+        f"{2026 - annee_revenu_ref} ans. Les salaires belges étant indexés sur l'inflation, ce revenu est "
+        f"**indexé de {(facteur_indexation - 1) * 100:+.1f}%** (IPCH Belgique, Eurostat, {annee_idx_ref} → "
+        f"{periode_idx_recente}) avant tout calcul ci-dessous — c'est une estimation d'indexation, "
+        "pas une vraie mesure de revenu plus récente."
+    )
+elif annee_revenu_ref:
+    st.warning(
+        f"⚠️ Le revenu des ménages date de {annee_revenu_ref} (écart avec le prix/taux 2026) et "
+        "l'indexation automatique (Eurostat) n'a pas pu être calculée maintenant — résultats basés "
+        "sur le revenu brut non indexé, probablement sous-estimés."
+    )
 
 # --- Paramètres de simulation ---
 col1, col2 = st.columns([2, 1])
@@ -148,7 +174,7 @@ mensualite = prix_simule * annuite_facteur(taux_simule, duree_simulee)
 revenu_requis = revenu_requis_pour_prix(prix_simule, taux_simule, duree_simulee)
 
 df_bassin["pct_menages_ok"] = df_bassin.apply(
-    lambda r: pct_menages_au_dessus(revenu_requis, r["lognormal_mu"], r["lognormal_sigma"]), axis=1
+    lambda r: pct_menages_au_dessus(revenu_requis, r["lognormal_mu_indexe"], r["lognormal_sigma"]), axis=1
 )
 
 pop_valide = df_bassin.loc[df_bassin["pct_menages_ok"].notna(), "population_totale"].sum()
@@ -172,17 +198,19 @@ if pct_agrege is not None:
     k3.metric(f"% ménages pouvant acheter — {label_zone}", f"{pct_agrege:.0f} %")
 else:
     k3.metric("% ménages pouvant acheter", "n.c.", help="Pas de distribution de revenu disponible pour cette zone.")
+revenu_median_ref_indexe = row_ref["revenu_median_menage_indexe"]
 k4.metric("Ménage médian peut acheter ?",
-          "Oui" if pd.notna(row_ref["revenu_median_menage"]) and row_ref["revenu_median_menage"] * 1.0 >= 0
-          and (row_ref["revenu_median_menage"] >= revenu_requis) else "Non",
-          help=f"Revenu médian de {row_ref['nom_commune']} : "
-               f"{row_ref['revenu_median_menage']:,.0f} €".replace(",", " ") if pd.notna(row_ref["revenu_median_menage"]) else "Donnée manquante")
+          "Oui" if pd.notna(revenu_median_ref_indexe) and revenu_median_ref_indexe >= revenu_requis else "Non",
+          help=(f"Revenu médian {annee_revenu_ref} indexé à aujourd'hui : "
+                f"{revenu_median_ref_indexe:,.0f} € (brut {annee_revenu_ref} : "
+                f"{row_ref['revenu_median_menage']:,.0f} €)".replace(",", " ")
+                if pd.notna(revenu_median_ref_indexe) else "Donnée manquante"))
 
 st.divider()
 st.subheader("Détail par commune du bassin" if minutes_max > 0 else "Détail")
 
 table = df_bassin[["nom_commune", "nom_province", "population_totale", "prix_median_maison",
-                    "revenu_median_menage", "pct_menages_ok"]].copy()
+                    "revenu_median_menage_indexe", "pct_menages_ok"]].copy()
 table = table.sort_values("pct_menages_ok", ascending=False, na_position="last")
 st.dataframe(
     table,
@@ -191,7 +219,8 @@ st.dataframe(
         "nom_province": "Province",
         "population_totale": st.column_config.NumberColumn("Population", format="%d"),
         "prix_median_maison": st.column_config.NumberColumn("Prix médian maison (€)", format="%d €"),
-        "revenu_median_menage": st.column_config.NumberColumn("Revenu médian ménage (€/an)", format="%d €"),
+        "revenu_median_menage_indexe": st.column_config.NumberColumn(
+            f"Revenu médian ménage (€/an, indexé depuis {annee_revenu_ref})", format="%d €"),
         "pct_menages_ok": st.column_config.NumberColumn("% ménages pouvant acheter à ce prix/taux", format="%.0f %%"),
     },
     hide_index=True, use_container_width=True,
@@ -245,6 +274,20 @@ assumée. Agrégation du % de ménages sur le bassin : moyenne pondérée par la
 **4. Taux hypothécaire** — proposé par défaut : dernier taux moyen réel de la BCE (ECB, série MIR,
 "Lending for house purchase", nouveaux contrats, ménages belges), mensuel, ~2 mois de décalage de
 publication. Toujours ajustable par curseur pour tester un scénario de taux différent.
+
+**5. Écart de millésime revenu/prix/taux — corrigé par indexation.** Le revenu des ménages
+({annee_revenu_ref if annee_revenu_ref else "n.c."}) est **structurellement plus ancien** que le prix
+immobilier et le taux hypothécaire (tous deux 2026) : les statistiques de revenu ont ~2-3 ans de retard
+de publication à l'échelle communale, contre un trimestre pour les prix et un mois pour les taux — ce
+n'est pas réparable en trouvant "une source plus récente", c'est une contrainte structurelle des données
+de revenu en Belgique. **Sans correction, la simulation sous-estimerait la capacité d'achat réelle**,
+car les salaires belges sont indexés automatiquement sur l'inflation (mécanisme légal de l'index santé).
+Correction appliquée : le revenu est **indexé** du facteur `IPCH_dernier / IPCH_{annee_revenu_ref if annee_revenu_ref else '?'}`
+(IPCH Belgique, Eurostat, `prc_hicp_midx`, API publique) — {f"{(facteur_indexation - 1) * 100:+.1f}% appliqué actuellement" if annee_revenu_ref else "non calculé actuellement"}.
+**Cette indexation est une estimation** : l'IPCH est un proxy officiel proche de l'index santé légal
+(qui exclut alcool/tabac/carburants) mais pas identique, et elle suppose que le revenu de chaque ménage
+suit l'inflation générale — vrai en moyenne pour les salaires indexés, faux pour les revenus non indexés
+(indépendants, certains capitaux). Le tableau ci-dessus affiche le revenu **indexé**, pas le brut Statbel.
 
 **Couverture** : {n_lognormal}/{len(communes)} communes ont un modèle de distribution calculable
 (nécessite médiane + Q1 + Q3 tous connus). Les autres affichent "n.c." plutôt qu'un chiffre inventé.

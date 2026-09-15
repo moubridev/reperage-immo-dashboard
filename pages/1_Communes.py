@@ -22,7 +22,7 @@ import streamlit as st
 import folium
 from streamlit_folium import st_folium
 
-from lib import get_credentials
+from lib import get_credentials, get_with_retry
 
 st.set_page_config(page_title="Communes — Repérage Immo", page_icon="🏘️", layout="wide")
 
@@ -44,8 +44,7 @@ def fetch_view(view_name, select="*"):
     rows, offset, page_size = [], 0, 1000
     while True:
         params = {"select": select, "limit": page_size, "offset": offset}
-        r = requests.get(f"{url}/rest/v1/{view_name}", headers=headers, params=params, timeout=60)
-        r.raise_for_status()
+        r = get_with_retry(requests.get, f"{url}/rest/v1/{view_name}", headers, params, timeout=60)
         page = r.json()
         rows.extend(page)
         if len(page) < page_size:

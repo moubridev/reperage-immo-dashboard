@@ -71,6 +71,59 @@ def pct_menages_au_dessus(seuil_revenu, mu, sigma):
     return max(0.0, min(1.0, phi)) * 100
 
 
+def get_indexation_revenu(annee_reference, ttl_cache=None):
+    """Coefficient d'indexation du revenu depuis `annee_reference` (moyenne annuelle)
+    jusqu'au dernier point disponible, via l'IPCH Belgique (Eurostat, proxy officiel de
+    l'indexation salariale belge — l'indice sante legal exclut alcool/tabac/carburants
+    et differe legerement de l'IPCH, mais suit la meme tendance de tres pres).
+    Retourne (facteur, annee_reference, periode_la_plus_recente) ou (1.0, None, None) si echec —
+    ne JAMAIS bloquer la simulation si Eurostat est indisponible, juste ne pas indexer."""
+    import requests as _requests
+    try:
+        r = _requests.get(
+            "https://ec.europa.eu/eurostat/api/dissemination/statistics/1.0/data/prc_hicp_midx",
+            params={"format": "JSON", "geo": "BE", "unit": "I15", "coicop": "CP00",
+                    "sinceTimePeriod": f"{annee_reference}-01"},
+            timeout=15,
+        )
+        r.raise_for_status()
+        data = r.json()
+        periods = data["dimension"]["time"]["category"]["index"]
+        values = data["value"]
+        inv = {v: k for k, v in periods.items()}
+        all_vals = {inv[int(p)]: v for p, v in values.items()}
+        ref_vals = [v for k, v in all_vals.items() if k.startswith(str(annee_reference))]
+        if not ref_vals:
+            return 1.0, None, None
+        ref_avg = sum(ref_vals) / len(ref_vals)
+        derniere_periode = sorted(all_vals.keys())[-1]
+        facteur = all_vals[derniere_periode] / ref_avg
+        return facteur, annee_reference, derniere_periode
+    except Exception:
+        return 1.0, None, None
+
+
+def get_with_retry(session_get, url, headers, params, timeout=60, tries=3):
+    """GET avec retry (backoff court) sur 500/503 — v_dashboard_communes a un vrai probleme
+    de timeout intermittent cote Postgres (trouve le 2026-09-15, partiellement corrige par un
+    index, pas totalement elimine). Ne masque pas l'erreur si elle persiste apres `tries` essais."""
+    import time as _time
+    last_exc = None
+    for attempt in range(tries):
+        try:
+            r = session_get(url, headers=headers, params=params, timeout=timeout)
+            if r.status_code in (500, 503) and attempt < tries - 1:
+                _time.sleep(1.5 * (attempt + 1))
+                continue
+            r.raise_for_status()
+            return r
+        except Exception as e:
+            last_exc = e
+            if attempt < tries - 1:
+                _time.sleep(1.5 * (attempt + 1))
+    raise last_exc
+
+
 def get_iso_proxy_credentials():
     """Proxy isochrones (Valhalla + géocodage) sur acolys-serveur.
     Streamlit Cloud: st.secrets. Local: fallback moubri/.env."""
