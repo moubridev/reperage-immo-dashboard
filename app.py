@@ -123,9 +123,32 @@ def build_frame():
 PEB_RENOVES = {"A++", "A+", "A", "B"}
 
 
+@st.cache_data(ttl=3600, show_spinner=False)
+def fetch_contexte_mdb():
+    """Contexte commune utile à la décision MdB : prix réellement réalisé (Statbel,
+    actes notariés) pour recouper l'ARV, et risque d'affaissement minier."""
+    url, key = get_credentials()
+    headers = {"apikey": key, "Authorization": f"Bearer {key}"}
+    r = requests.get(
+        f"{url}/rest/v1/v_dashboard_communes",
+        headers=headers,
+        params={"select": "nom_commune,prix_median_maison,dans_zone_houillere,anciennete_active_jours", "limit": 1000},
+        timeout=30,
+    )
+    r.raise_for_status()
+    ctx = pd.DataFrame(r.json())
+    if not ctx.empty:
+        ctx["commune_norm"] = ctx["nom_commune"].str.strip().str.upper()
+        for c in ["prix_median_maison", "anciennete_active_jours"]:
+            ctx[c] = pd.to_numeric(ctx[c], errors="coerce")
+    return ctx
+
+
 def compute_mdb_scores(
     df_scope, df_all, peb_cibles, taux_enregistrement_pct, cout_travaux_m2,
     frais_vente_pct, taux_financier_annuel_pct, duree_portage_mois, appliquer_isoc, isoc_pct,
+    decote_arv_pct=8.0, frais_notaire_pct=1.6, frais_acte_eur=1300,
+    tva_travaux_pct=6.0, charges_portage_mensuelles=180,
 ):
     """Marge d'un flip MdB, structurée comme `charge_fonciere.py` (Dev Log
     2026-08-31 : C = (R_nette − Cc − Ca − Marge − 0,5·Cc·f) / (1 + e + f)) —
@@ -174,24 +197,77 @@ def compute_mdb_scores(
     e = taux_enregistrement_pct / 100
     f = (taux_financier_annuel_pct / 100) * (duree_portage_mois / 12)
 
-    d["arv_brut"] = comp_m2 * d["surface_habitable"] * 1.05
-    d["cout_travaux"] = d["surface_habitable"] * cout_travaux_m2
+    # ARV : les comparables sont des PRIX DEMANDÉS. Mesuré le 2026-09-16 sur 81 communes :
+    # le prix demandé médian vaut ~1,24× le prix réellement acté (Statbel). Une partie est
+    # un effet de stock (les biens surévalués restent en vitrine), une partie est la vraie
+    # marge de négociation — d'où une décote paramétrable plutôt qu'un chiffre figé.
+    # L'ancien code appliquait ×1,05, ce qui AGGRAVAIT le biais optimiste.
+    d["arv_brut"] = comp_m2 * d["surface_habitable"] * (1 - decote_arv_pct / 100)
+
+    # Travaux TVA comprise (6% si bâtiment >10 ans, 21% sinon) — 15 points d'écart
+    # sur tout le budget travaux, soit souvent plus que la marge de sécurité du deal.
+    d["cout_travaux"] = d["surface_habitable"] * cout_travaux_m2 * (1 + tva_travaux_pct / 100)
+
+    # Coûts d'acquisition : droits d'enregistrement + honoraires notaire + frais d'acte.
+    # Les deux derniers étaient totalement absents : ~3-4 k€ sur un bien à 150 k€,
+    # soit 2-3% du deal pris directement sur la marge.
     d["cout_enregistrement"] = d["prix"] * e
+    d["frais_acquisition"] = d["prix"] * (frais_notaire_pct / 100) + frais_acte_eur
+
     # Portage : capital immobilisé = prix payé dès le jour 1 + travaux tirés
     # progressivement (approximé à la moitié du budget travaux, comme dans
     # charge_fonciere.py : "0,5·Cc·f").
     d["cout_financier"] = (d["prix"] + 0.5 * d["cout_travaux"]) * f
+    # Charges de détention (précompte immobilier, assurance, énergie, syndic) —
+    # absentes de l'ancienne formule.
+    d["charges_portage"] = charges_portage_mensuelles * duree_portage_mois
     d["cout_vente"] = d["arv_brut"] * (frais_vente_pct / 100)
 
     d["marge_eur"] = (
-        d["arv_brut"] - d["prix"] - d["cout_enregistrement"] - d["cout_travaux"]
-        - d["cout_financier"] - d["cout_vente"]
+        d["arv_brut"] - d["prix"] - d["cout_enregistrement"] - d["frais_acquisition"]
+        - d["cout_travaux"] - d["cout_financier"] - d["charges_portage"] - d["cout_vente"]
     )
     if appliquer_isoc:
         d["marge_eur"] = d["marge_eur"].clip(lower=0) * (1 - isoc_pct / 100) + d["marge_eur"].clip(upper=0)
     d["marge_pct"] = (d["marge_eur"] / d["arv_brut"] * 100)
 
+    # Capital réellement immobilisé — base de rendement bien plus parlante pour un MdB
+    # que la marge rapportée à l'ARV.
+    d["capital_engage"] = (
+        d["prix"] + d["cout_enregistrement"] + d["frais_acquisition"]
+        + d["cout_travaux"] + d["charges_portage"]
+    )
+    d["roi_pct"] = d["marge_eur"] / d["capital_engage"] * 100
+    # La rotation du capital EST le métier : 12% en 6 mois bat 20% en 18 mois.
+    d["roi_annualise_pct"] = d["roi_pct"] * (12 / max(duree_portage_mois, 1))
+
     d = d[d["arv_brut"].notna() & d["marge_pct"].notna()]
+    return d
+
+
+def compute_mdb_scores_enrichi(*args, **kwargs):
+    """compute_mdb_scores + le contexte que le praticien regarde AVANT de se déplacer :
+    l'ARV tient-il face au marché réellement acté, et y a-t-il un risque de sol
+    (affaissement minier) qui tue le deal ou justifie une renégociation."""
+    d = compute_mdb_scores(*args, **kwargs)
+    if d.empty:
+        return d
+    try:
+        ctx = fetch_contexte_mdb()
+    except Exception:
+        return d
+    if ctx.empty:
+        return d
+
+    d = d.merge(
+        ctx[["commune_norm", "prix_median_maison", "dans_zone_houillere", "anciennete_active_jours"]],
+        on="commune_norm", how="left",
+    )
+    # Garde-fou de sortie : un ARV très au-dessus du prix médian RÉELLEMENT acté de la
+    # commune signale une hypothèse de revente agressive (ou un bien atypique) — c'est
+    # là que les plans de MdB se cassent, pas sur le coût des travaux.
+    d["arv_vs_marche_pct"] = (d["arv_brut"] / d["prix_median_maison"] - 1) * 100
+    d["alerte_arv"] = d["arv_vs_marche_pct"] > 40
     return d
 
 
@@ -369,7 +445,12 @@ st.sidebar.subheader("🎯 Analyse marchand de biens")
 with st.sidebar.expander("Hypothèses de calcul", expanded=False):
     peb_cibles = st.multiselect("PEB cible (achat dégradé)", ["G", "F", "E", "D", "C"], default=defaults.get("peb_cibles", ["G", "F", "E"]))
     taux_enregistrement_pct = st.number_input("Droits d'enregistrement (%)", min_value=0.0, max_value=20.0, value=defaults.get("taux_enregistrement_pct", 7.5), step=0.5, help="Non confirmé avec un comptable (régime MdB) — voir Shortlist-GO-Mons-2026-06-11.")
-    cout_travaux_m2 = st.number_input("Coût travaux (€/m²)", min_value=0, max_value=3000, value=defaults.get("cout_travaux_m2", 850), step=50, help="Forfait unique quel que soit l'écart PEB — à affiner par palier si besoin.")
+    frais_notaire_pct = st.number_input("Honoraires notaire (%)", min_value=0.0, max_value=5.0, value=defaults.get("frais_notaire_pct", 1.6), step=0.1, help="Honoraires dégressifs, hors droits d'enregistrement. Étaient totalement absents du calcul avant le 16/09.")
+    frais_acte_eur = st.number_input("Frais d'acte fixes (€)", min_value=0, max_value=10000, value=defaults.get("frais_acte_eur", 1300), step=100, help="Recherches, formalités, transcription hypothécaire.")
+    decote_arv_pct = st.number_input("Décote prix demandé → prix acté (%)", min_value=0.0, max_value=40.0, value=defaults.get("decote_arv_pct", 8.0), step=1.0, help="Les comparables sont des PRIX DEMANDÉS. Mesuré sur 81 communes le 16/09 : le demandé médian vaut 1,24× l'acté Statbel (interquartile 1,12–1,38) — une partie est un effet de stock, une partie une vraie marge de négociation. 8% = prudent ; 0% = vous croyez le prix affiché.")
+    cout_travaux_m2 = st.number_input("Coût travaux HTVA (€/m²)", min_value=0, max_value=3000, value=defaults.get("cout_travaux_m2", 850), step=50, help="Hors TVA, forfait unique quel que soit l'écart PEB — à affiner par palier si besoin.")
+    tva_travaux_pct = st.number_input("TVA travaux (%)", min_value=0.0, max_value=21.0, value=defaults.get("tva_travaux_pct", 6.0), step=15.0, help="6% pour un bâtiment de plus de 10 ans, 21% sinon. 15 points d'écart sur tout le budget travaux.")
+    charges_portage_mensuelles = st.number_input("Charges de détention (€/mois)", min_value=0, max_value=3000, value=defaults.get("charges_portage_mensuelles", 180), step=20, help="Précompte immobilier, assurance, énergie, syndic. Absentes du calcul avant le 16/09.")
     frais_vente_pct = st.number_input("Frais de revente (%)", min_value=0.0, max_value=15.0, value=defaults.get("frais_vente_pct", 6.0), step=0.5, help="Agence + notaire à la revente. Absent de l'ancienne formule — c'est le bug déjà noté sur le rapport Fichaux 6.")
     taux_financier_annuel_pct = st.number_input("Coût du capital annuel (%)", min_value=0.0, max_value=15.0, value=defaults.get("taux_financier_annuel_pct", 5.0), step=0.5, help="Taux de financement ou coût d'opportunité si cash.")
     duree_portage_mois = st.number_input("Durée de portage (mois)", min_value=1, max_value=60, value=defaults.get("duree_portage_mois", 9), step=1)
@@ -387,6 +468,9 @@ if st.sidebar.button("💾 Sauvegarder ces critères par défaut"):
         "chambres_min": chambres_min, "annee_min": annee_min, "jours_max": jours_max,
         "peb_cibles": peb_cibles, "taux_enregistrement_pct": taux_enregistrement_pct,
         "cout_travaux_m2": cout_travaux_m2, "frais_vente_pct": frais_vente_pct,
+        "frais_notaire_pct": frais_notaire_pct, "frais_acte_eur": frais_acte_eur,
+        "decote_arv_pct": decote_arv_pct, "tva_travaux_pct": tva_travaux_pct,
+        "charges_portage_mensuelles": charges_portage_mensuelles,
         "taux_financier_annuel_pct": taux_financier_annuel_pct, "duree_portage_mois": duree_portage_mois,
         "appliquer_isoc": appliquer_isoc, "isoc_pct": isoc_pct,
         "seuil_go_fort": seuil_go_fort, "seuil_go": seuil_go, "seuil_limite": seuil_limite,
@@ -433,15 +517,21 @@ st.markdown("---")
 if transaction == "vente":
     st.subheader("🎯 Meilleures opportunités — achat dégradé → rénovation → revente")
     st.caption(
-        "Marge = ARV brut − prix − enregistrement − travaux − portage/financement − frais de revente"
+        "Marge = ARV − prix − enregistrement − **honoraires notaire & frais d'acte** − travaux TVAC "
+        "− portage/financement − **charges de détention** − frais de revente"
         + (" − ISOC" if appliquer_isoc else "") + ". "
-        "ARV comparé sur des **annonces de vente** PEB A-B du secteur (prix demandés, pas des ventes réelles — "
-        "sous-estime probablement la fiabilité). **Un tri pour prioriser les visites, jamais une offre.**"
+        f"ARV = comparables PEB A-B du secteur (**prix demandés**) minorés de la décote de négociation "
+        f"retenue ({decote_arv_pct:.0f}%). Mesuré le 16/09 sur 81 communes : le prix demandé médian vaut "
+        "**1,24× le prix réellement acté** (Statbel) — d'où la décote, et la colonne « ARV vs marché acté » "
+        "qui compare chaque ARV au marché réel de la commune. **Un tri pour prioriser les visites, jamais une offre.**"
     )
 
-    mdb = compute_mdb_scores(
+    mdb = compute_mdb_scores_enrichi(
         f, df, peb_cibles, taux_enregistrement_pct, cout_travaux_m2,
         frais_vente_pct, taux_financier_annuel_pct, duree_portage_mois, appliquer_isoc, isoc_pct,
+        decote_arv_pct=decote_arv_pct, frais_notaire_pct=frais_notaire_pct,
+        frais_acte_eur=frais_acte_eur, tva_travaux_pct=tva_travaux_pct,
+        charges_portage_mensuelles=charges_portage_mensuelles,
     )
 
     if mdb.empty:
@@ -462,16 +552,24 @@ if transaction == "vente":
             st.caption(f"⚠️ {low_n} biens notés avec un comparable de secours au niveau région (moins de 5 annonces PEB A-B trouvées dans leur commune) — marge moins fiable pour ceux-là, colonne « Comparable ».")
 
         show = mdb[mdb["statut"] != "⬛ Écarté"].head(200)
+        show = show.copy()
+        # Drapeaux que le praticien veut voir avant de se déplacer.
+        show["signal"] = (
+            show.get("alerte_arv", False).fillna(False).map({True: "⚠️ ARV ", False: ""})
+            + show.get("dans_zone_houillere", False).fillna(False).map({True: "⛏️ Minier", False: ""})
+        ).str.strip()
         top_table = show[
-            ["statut", "commune", "code_postal", "prix", "peb", "surface_habitable", "nb_chambres",
-             "jours_sur_marche", "arv_brut", "cout_travaux", "cout_financier", "cout_vente",
-             "marge_pct", "comparable_source", "n_comparables", "url_principale"]
+            ["statut", "signal", "commune", "code_postal", "prix", "peb", "surface_habitable", "nb_chambres",
+             "jours_sur_marche", "arv_brut", "arv_vs_marche_pct", "cout_travaux", "capital_engage",
+             "marge_eur", "marge_pct", "roi_annualise_pct", "comparable_source", "n_comparables", "url_principale"]
         ].rename(columns={
-            "statut": "Statut", "commune": "Commune", "code_postal": "CP", "prix": "Prix (€)",
+            "statut": "Statut", "signal": "Signal", "commune": "Commune", "code_postal": "CP", "prix": "Prix (€)",
             "peb": "PEB", "surface_habitable": "Surface (m²)", "nb_chambres": "Ch.",
-            "jours_sur_marche": "Jours en ligne", "arv_brut": "ARV brut (€)",
-            "cout_travaux": "Travaux (€)", "cout_financier": "Portage (€)", "cout_vente": "Frais revente (€)",
-            "marge_pct": "Marge %", "comparable_source": "Comparable", "n_comparables": "N comp.",
+            "jours_sur_marche": "Jours en ligne", "arv_brut": "ARV (€)",
+            "arv_vs_marche_pct": "ARV vs marché acté", "cout_travaux": "Travaux TVAC (€)",
+            "capital_engage": "Capital engagé (€)", "marge_eur": "Marge (€)",
+            "marge_pct": "Marge %", "roi_annualise_pct": "ROI annualisé %",
+            "comparable_source": "Comparable", "n_comparables": "N comp.",
             "url_principale": "Annonce",
         })
         st.dataframe(
@@ -482,11 +580,17 @@ if transaction == "vente":
             column_config={
                 "Annonce": st.column_config.LinkColumn("Annonce", display_text="Voir ↗"),
                 "Marge %": st.column_config.NumberColumn("Marge %", format="%.0f %%"),
+                "ROI annualisé %": st.column_config.NumberColumn(
+                    "ROI annualisé %", format="%.0f %%",
+                    help="Marge / capital réellement engagé, ramenée à l'année. La rotation du capital est le nerf du métier : 12% en 6 mois bat 20% en 18 mois."),
+                "Marge (€)": st.column_config.NumberColumn("Marge (€)", format="%d €"),
+                "Capital engagé (€)": st.column_config.NumberColumn("Capital engagé (€)", format="%d €"),
                 "Prix (€)": st.column_config.NumberColumn("Prix (€)", format="%d €"),
-                "ARV brut (€)": st.column_config.NumberColumn("ARV brut (€)", format="%d €"),
-                "Travaux (€)": st.column_config.NumberColumn("Travaux (€)", format="%d €"),
-                "Portage (€)": st.column_config.NumberColumn("Portage (€)", format="%d €"),
-                "Frais revente (€)": st.column_config.NumberColumn("Frais revente (€)", format="%d €"),
+                "ARV (€)": st.column_config.NumberColumn("ARV (€)", format="%d €"),
+                "ARV vs marché acté": st.column_config.NumberColumn(
+                    "ARV vs marché acté", format="%+.0f %%",
+                    help="Écart entre l'ARV retenu et le prix médian réellement acté (Statbel) de la commune. Au-delà de +40%, l'hypothèse de revente est agressive — drapeau ⚠️ ARV."),
+                "Travaux TVAC (€)": st.column_config.NumberColumn("Travaux TVAC (€)", format="%d €"),
             },
         )
         st.caption(f"{len(mdb) - len(show)} biens supplémentaires écartés ou hors du top 200 (ajustez les filtres pour affiner).")
