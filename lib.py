@@ -35,6 +35,42 @@ def get_credentials():
     return url, key
 
 
+def annuite_facteur(taux_annuel_pct, annees):
+    """Mensualite par euro emprunte, formule d'annuite standard.
+    taux_annuel_pct en % (ex. 3.64), annees = duree du pret.
+    Verifie a l'exact contre le facteur reverse-engineere le 13/09/2026
+    (0,0058925 pour ~3,67%/20 ans) — meme formule, generalisee a tout taux/duree."""
+    r_mensuel = (taux_annuel_pct / 100) / 12
+    n_mois = annees * 12
+    if r_mensuel == 0:
+        return 1 / n_mois
+    return r_mensuel / (1 - (1 + r_mensuel) ** -n_mois)
+
+
+def capacite_emprunt(revenu_annuel_menage, taux_annuel_pct, annees, taux_effort=0.33):
+    """Capacite d'emprunt max pour un revenu menage donne (33% du revenu mensuel, meme regle que le reste du dashboard)."""
+    mensualite_max = (revenu_annuel_menage / 12) * taux_effort
+    return mensualite_max / annuite_facteur(taux_annuel_pct, annees)
+
+
+def revenu_requis_pour_prix(prix, taux_annuel_pct, annees, taux_effort=0.33):
+    """Revenu annuel menage necessaire pour financer `prix` a ce taux/duree, meme regle d'effort 33%."""
+    mensualite = prix * annuite_facteur(taux_annuel_pct, annees)
+    return (mensualite / taux_effort) * 12
+
+
+def pct_menages_au_dessus(seuil_revenu, mu, sigma):
+    """% de menages dont le revenu (modele log-normal, parametres mu/sigma ajustes sur
+    median/Q1/Q3 Statbel reels) depasse `seuil_revenu`. ESTIMATION statistique, pas une
+    distribution observee directement — voir commentaire SQL sur communes_capacite_emprunt.lognormal_mu."""
+    import math
+    if mu is None or sigma is None or sigma <= 0 or seuil_revenu <= 0:
+        return None
+    z = (math.log(seuil_revenu) - mu) / sigma
+    phi = 0.5 * (1 + math.erf(-z / math.sqrt(2)))
+    return max(0.0, min(1.0, phi)) * 100
+
+
 def get_iso_proxy_credentials():
     """Proxy isochrones (Valhalla + géocodage) sur acolys-serveur.
     Streamlit Cloud: st.secrets. Local: fallback moubri/.env."""
