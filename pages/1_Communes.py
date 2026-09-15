@@ -29,6 +29,7 @@ st.set_page_config(page_title="Communes — Repérage Immo", page_icon="🏘️"
 COMMUNES_VIEW = "v_dashboard_communes"
 HIST_VIEW = "v_dashboard_communes_historique"
 KOHESIO_VIEW = "v_dashboard_kohesio"
+DEMO_VIEW = "v_dashboard_demographie"
 
 SCORE_COLS = ["score_marche", "score_prix", "score_demo", "score_mobilite"]
 SCORE_LABELS = ["Marché", "Prix/Accessibilité", "Démographie", "Mobilité"]
@@ -81,6 +82,7 @@ with st.spinner("Chargement des données communes..."):
     df, fetched_at = fetch_view(COMMUNES_VIEW)
     hist, _ = fetch_view(HIST_VIEW)
     kohesio, _ = fetch_view(KOHESIO_VIEW)
+    demo, _ = fetch_view(DEMO_VIEW)
 
 if df.empty:
     st.warning("Aucune donnée reçue.")
@@ -221,6 +223,47 @@ with c1:
     d1.metric("Revenu médian net", f"{row['revenu_median_net']:,.0f} €".replace(",", " ") if pd.notna(row["revenu_median_net"]) else "n.c.")
     d2.metric("Taux de chômage", f"{row['taux_chomage_pct']:.1f} %" if pd.notna(row["taux_chomage_pct"]) else "n.c.")
     d3.metric("% propriétaires", f"{row['pct_proprietaires']:.0f} %" if pd.notna(row["pct_proprietaires"]) else "n.c.")
+
+    # --- Dynamique de population et tension logement ---
+    demo_row = demo[demo["code_ins"] == row["code_ins"]]
+    if not demo_row.empty:
+        dr = demo_row.iloc[0]
+        st.markdown("**Dynamique de population & tension logement**")
+        g1, g2, g3, g4 = st.columns(4)
+        g1.metric(
+            "Croissance population",
+            f"{dr['croissance_pop_pct']:+.1f} %" if pd.notna(dr["croissance_pop_pct"]) else "n.c.",
+            help=f"Entre le recensement 2021 ({dr['pop_recensement_2021']:,.0f} hab.) et le registre "
+                 f"{int(dr['annee_population_recente']) if pd.notna(dr['annee_population_recente']) else '?'} "
+                 f"({dr['pop_registre_recente']:,.0f} hab.). ⚠️ DEUX points seulement, et de deux sources "
+                 "différentes (recensement vs registre) : c'est un ordre de grandeur, pas une tendance "
+                 "mesurée — on ne peut pas voir d'inflexion.".replace(",", " "),
+        )
+        g2.metric(
+            "Solde migratoire",
+            f"{dr['solde_migratoire']:+.1f}" if pd.notna(dr["solde_migratoire"]) else "n.c.",
+            help="Entrées − sorties (source IWEPS). Une commune qui grandit par migration n'a pas le même "
+                 "profil qu'une commune qui grandit par natalité — mais le solde naturel (naissances − décès) "
+                 "est absent de la base, la décomposition est donc incomplète.",
+        )
+        g3.metric(
+            "Ménages suppl. estimés",
+            f"{dr['menages_supplementaires_estimes']:+,.0f}".replace(",", " ") if pd.notna(dr["menages_supplementaires_estimes"]) else "n.c.",
+            help="Variation d'habitants ÷ taille moyenne des ménages. Sous-estime la demande réelle : "
+                 "la taille des ménages diminue, ce qui crée un besoin de logements même à population constante.",
+        )
+        solde_log = dr["solde_logements_vs_menages"]
+        g4.metric(
+            "Logements autorisés − besoin",
+            f"{solde_log:+,.0f}".replace(",", " ") if pd.notna(solde_log) else "n.c.",
+            delta="tension" if pd.notna(solde_log) and solde_log < 0 else None,
+            delta_color="inverse",
+            help=f"{dr['logements_autorises_2021_2025']:,.0f} logements neufs AUTORISÉS 2021-2025 moins les "
+                 "ménages supplémentaires estimés. Négatif = la production ne suit pas la démographie. "
+                 "⚠️ Permis ≠ logements achevés (certains ne sortent jamais de terre, 1-2 ans de décalage), "
+                 "et le stock vacant absorbable n'est pas déduit. Signal relatif entre communes, "
+                 "jamais un déficit chiffré.".replace(",", " "),
+        )
 
     st.markdown("**Marché élargi** (hors score — indicatif)")
     e1, e2, e3, e4 = st.columns(4)
