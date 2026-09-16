@@ -129,11 +129,32 @@ def build_frame():
     df["commune_norm"] = df["commune"].str.strip().str.upper()
     df["source_prix"] = df["url_principale"].apply(classify_source_prix)
 
-    # Comparable marché "prix/m²" par commune, tous types/PEB confondus (pour le
-    # ratio "vs marché local") — calculé sur tout le jeu de données, pas sur la
-    # sélection filtrée, pour rester un vrai comparable indépendant des filtres.
-    commune_comp_all = df.groupby("commune_norm")["prix_m2"].median()
+    # Comparable marché "prix/m²" par commune (pour le ratio "vs marché local") —
+    # calculé sur tout le jeu de données, pas sur la sélection filtrée, pour rester
+    # un vrai comparable indépendant des filtres.
+    #
+    # Bug réel trouvé le 16/09 (feedback utilisateur "on se perd dans les calculs,
+    # je veux revoir les biens sous le marché") : la médiane mélangeait vente ET
+    # location. Un €/m² de LOYER (quelques dizaines d'euros) tiré dans le même pool
+    # qu'un €/m² de PRIX DE VENTE (des milliers d'euros) fait chuter artificiellement
+    # la médiane — chaque bien à vendre paraissait alors plus "sous le marché" qu'il
+    # ne l'était réellement. Mesuré sur Mons : médiane contaminée 1 377 €/m² contre
+    # 1 909 €/m² en ne gardant que les ventes — un bien à 1 500 €/m² passait de
+    # "+9% au-dessus du marché" à "-21% en dessous" selon la version du calcul.
+    # Même garde-fou de plausibilité que le scoring MdB (type de bien + prix/m² >= 400,
+    # trouvés le 16/09) : sans lui, ce comparateur — plus simple, censé être plus fiable
+    # que le scoring MdB — hériterait du même biais (prix à 800-2 500 € sur des maisons,
+    # ou des commerces/industriels mélangés à du résidentiel).
+    comp_marche = df[
+        (df["type_transaction"] == "vente")
+        & df["type_bien"].isin(["maison", "appartement"])
+        & df["surface_habitable"].between(15, 600)
+        & (df["prix_m2"] >= 400)
+    ]
+    commune_comp_all = comp_marche.groupby("commune_norm")["prix_m2"].median()
+    commune_comp_n = comp_marche.groupby("commune_norm")["prix_m2"].count()
     df["commune_prix_m2_median"] = df["commune_norm"].map(commune_comp_all)
+    df["commune_n_comparables"] = df["commune_norm"].map(commune_comp_n).fillna(0).astype(int)
     df["ecart_vs_marche_pct"] = (
         (df["prix_m2"] - df["commune_prix_m2_median"]) / df["commune_prix_m2_median"] * 100
     )
@@ -592,11 +613,72 @@ k5.metric("En ligne depuis (médiane)", f"{int(f['jours_sur_marche'].median())} 
 
 st.markdown("---")
 
+# ------------------------------------------------------- biens sous le marché
+# Remis en avant le 16/09 (feedback utilisateur) : le signal simple et robuste
+# "ce bien se vend moins cher que le marché local" s'était fait enterrer sous
+# l'empilement de paramètres du scoring MdB (ARV, travaux, ISOC, tickets,
+# enchères...). Aucune hypothèse de rénovation, de financement ou de fiscalité
+# ici — juste le prix/m² comparé à la médiane RÉELLE des ventes de la commune
+# (bug de contamination par les locations corrigé le même jour, voir build_frame).
+
+st.subheader("💎 Biens sous le marché local")
+st.caption(
+    "Écart du prix/m² par rapport à la médiane des VENTES maison/appartement de la commune — "
+    "aucune hypothèse de rénovation ni de financement, juste le prix affiché comparé au marché "
+    "local. Moins riche que l'analyse MdB ci-dessous, mais moins d'hypothèses à faire confiance : "
+    "c'est le point de départ, pas le calcul final."
+)
+ecart_seuil = st.slider("Écart minimum sous le marché (%)", -60, 0, -15, 5)
+comp_min = st.number_input("Nombre minimum de ventes comparables dans la commune", 0, 50, 5, 1,
+                           help="En dessous, la médiane communale repose sur trop peu de ventes "
+                                "pour être fiable — le bien est écarté plutôt que d'afficher un "
+                                "écart trompeur.")
+# Même garde-fou de plausibilité que le scoring MdB (type de bien, surface, prix/m² —
+# trouvés le 16/09) : sans lui ce tableau, censé être PLUS fiable que le scoring MdB,
+# hériterait du même biais (maisons à 800-2 500 €, terrains/garages mal catégorisés).
+sous_marche_surface_ok = (
+    (f["type_bien"].eq("appartement") & f["surface_habitable"].between(15, 350))
+    | (f["type_bien"].eq("maison") & f["surface_habitable"].between(25, 600))
+)
+sous_marche = f[
+    f["type_bien"].isin(["maison", "appartement"])
+    & sous_marche_surface_ok
+    & (f["prix_m2"] >= prix_m2_plancher)
+    & f["ecart_vs_marche_pct"].notna()
+    & (f["ecart_vs_marche_pct"] <= ecart_seuil)
+    & (f["commune_n_comparables"] >= comp_min)
+].sort_values("ecart_vs_marche_pct").copy()
+
+st.metric("Biens sous le marché", f"{len(sous_marche):,}".replace(",", " "))
+if sous_marche.empty:
+    st.info("Aucun bien sous ce seuil avec les filtres actuels.")
+else:
+    sm_table = sous_marche.head(100)[
+        ["commune", "code_postal", "type_bien", "prix", "surface_habitable", "peb",
+         "jours_sur_marche", "ecart_vs_marche_pct", "commune_n_comparables", "url_principale"]
+    ].rename(columns={
+        "commune": "Commune", "code_postal": "CP", "type_bien": "Type", "prix": "Prix (€)",
+        "surface_habitable": "Surface (m²)", "peb": "PEB", "jours_sur_marche": "Jours en ligne",
+        "ecart_vs_marche_pct": "vs marché (%)", "commune_n_comparables": "N ventes comparables",
+        "url_principale": "Annonce",
+    })
+    st.dataframe(
+        sm_table, use_container_width=True, height=380, hide_index=True,
+        column_config={
+            "vs marché (%)": st.column_config.NumberColumn(format="%.0f %%"),
+            "Annonce": st.column_config.LinkColumn(display_text="Voir ↗"),
+        },
+    )
+
+st.markdown("---")
+
 # ---------------------------------------------------------------- analyse MdB
 
 if transaction == "vente":
-    st.subheader("🎯 Meilleures opportunités — achat dégradé → rénovation → revente")
+    st.subheader("🎯 Analyse approfondie MdB — achat dégradé → rénovation → revente")
     st.caption(
+        "Étape suivante, optionnelle : simule une rénovation complète plutôt qu'une simple "
+        "comparaison de prix — plus riche, mais plus d'hypothèses à faire confiance. "
         "Marge = ARV − prix − enregistrement − **honoraires notaire & frais d'acte** − travaux TVAC "
         "− portage/financement − **charges de détention** − frais de revente"
         + (" − ISOC" if appliquer_isoc else "") + ". "
