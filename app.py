@@ -664,12 +664,6 @@ comp_min = st.number_input("Nombre minimum de ventes comparables dans la commune
                            help="En dessous, la médiane communale repose sur trop peu de ventes "
                                 "pour être fiable — le bien est écarté plutôt que d'afficher un "
                                 "écart trompeur.")
-inclure_encheres = st.checkbox(
-    "Inclure Biddit / notaire.be enchères", value=False,
-    help="Trouvé le 16/09 en analysant ce classement : les enchères affichent une mise à prix, "
-         "pas un prix de vente attendu — elles représentaient 50% du top 20 par écart alors "
-         "qu'elles ne sont que 6% du gisement total. Décochées par défaut pour garder ce "
-         "classement fiable ; cochez pour les voir quand même, repérables au drapeau 🔨.")
 # Même garde-fou de plausibilité que le scoring MdB (type de bien, surface, prix/m² —
 # trouvés le 16/09) : sans lui ce tableau, censé être PLUS fiable que le scoring MdB,
 # hériterait du même biais (maisons à 800-2 500 €, terrains/garages mal catégorisés).
@@ -677,14 +671,21 @@ sous_marche_surface_ok = (
     (f["type_bien"].eq("appartement") & f["surface_habitable"].between(15, 350))
     | (f["type_bien"].eq("maison") & f["surface_habitable"].between(25, 600))
 )
-sous_marche = f[
+sous_marche_base = f[
     f["type_bien"].isin(["maison", "appartement"])
     & sous_marche_surface_ok
     & (f["prix_m2"] >= prix_m2_plancher)
     & f["ecart_vs_marche_pct"].notna()
-    & (f["ecart_vs_marche_pct"] <= ecart_seuil)
     & (f["commune_n_comparables"] >= comp_min)
-    & (inclure_encheres | (f["source_prix"] == "immoweb"))
+].copy()
+# Enchères (Biddit/notaire.be) tenues À PART, jamais mélangées au classement principal :
+# leur prix affiché est une mise à prix, pas un prix de vente attendu — les y mélanger
+# reproduirait le biais trouvé et corrigé le 16/09 (50% du top 20 par écart alors
+# qu'elles ne sont que 6% du gisement). Réapparaissent ci-dessous à la demande de
+# l'utilisateur, dans leur propre section, classées sur un prix majoré (paramètre
+# `majoration_encheres_pct` de la sidebar, 0% par défaut faute de statistique fiable).
+sous_marche = sous_marche_base[
+    (sous_marche_base["ecart_vs_marche_pct"] <= ecart_seuil) & (sous_marche_base["source_prix"] == "immoweb")
 ].sort_values("ecart_vs_marche_pct").copy()
 
 # Doublons cross-source : la même vente judiciaire ou "opportunité" apparaît souvent
@@ -705,13 +706,11 @@ if n_doublons:
 if sous_marche.empty:
     st.info("Aucun bien sous ce seuil avec les filtres actuels.")
 else:
-    sous_marche["signal"] = sous_marche["source_prix"].isin(
-        ["enchere_biddit", "enchere_notaire"]).map({True: "🔨", False: ""})
     sm_table = sous_marche.head(100)[
-        ["signal", "commune", "code_postal", "type_bien", "prix", "surface_habitable", "peb",
+        ["commune", "code_postal", "type_bien", "prix", "surface_habitable", "peb",
          "jours_sur_marche", "ecart_vs_marche_pct", "commune_n_comparables", "url_principale"]
     ].rename(columns={
-        "signal": "", "commune": "Commune", "code_postal": "CP", "type_bien": "Type", "prix": "Prix (€)",
+        "commune": "Commune", "code_postal": "CP", "type_bien": "Type", "prix": "Prix (€)",
         "surface_habitable": "Surface (m²)", "peb": "PEB", "jours_sur_marche": "Jours en ligne",
         "ecart_vs_marche_pct": "vs marché (%)", "commune_n_comparables": "N ventes comparables",
         "url_principale": "Annonce",
@@ -720,6 +719,57 @@ else:
         sm_table, use_container_width=True, height=380, hide_index=True,
         column_config={
             "vs marché (%)": st.column_config.NumberColumn(format="%.0f %%"),
+            "Annonce": st.column_config.LinkColumn(display_text="Voir ↗"),
+        },
+    )
+
+# --------------------------------------------------------- enchères, à part
+# Remises en avant à la demande de l'utilisateur (16/09) : les enchères sont une
+# vraie source de biens sous le marché, souvent la plus profitable — mais leur prix
+# affiché est une mise à prix, pas un prix de vente attendu, donc une section séparée
+# plutôt que mélangées au classement principal (voir commentaire ci-dessus).
+st.markdown("##### 🔨 Enchères sous le marché (Biddit / notaire.be)")
+st.caption(
+    "Prix affiché = mise à prix, pas prix de vente attendu — souvent revu à la hausse "
+    "aux enchères. « Écart estimé » applique la majoration réglée dans la sidebar "
+    f"({majoration_encheres_pct:.0f}% actuellement — 0% par défaut, aucune statistique "
+    "belge fiable trouvée sur l'écart réel mise à prix → prix adjugé : à vous de "
+    "calibrer si vous avez une expérience de terrain). À vérifier au cas par cas, "
+    "plus encore que le reste de cette page."
+)
+encheres = sous_marche_base[sous_marche_base["source_prix"] != "immoweb"].copy()
+encheres["prix_estime"] = encheres["prix"] * (1 + majoration_encheres_pct / 100)
+encheres["ecart_estime_pct"] = (
+    (encheres["prix_estime"] / encheres["surface_habitable"] - encheres["commune_prix_m2_median"])
+    / encheres["commune_prix_m2_median"] * 100
+)
+encheres["dup_key"] = (
+    encheres["commune_norm"] + "_" + encheres["prix"].astype(str) + "_" + encheres["surface_habitable"].astype(str)
+)
+n_encheres_avant_dedup = len(encheres)
+encheres = encheres.drop_duplicates("dup_key")
+n_encheres_doublons = n_encheres_avant_dedup - len(encheres)
+encheres = encheres[encheres["ecart_estime_pct"] <= ecart_seuil].sort_values("ecart_estime_pct")
+if n_encheres_doublons:
+    st.caption(f"({n_encheres_doublons} doublons cross-source retirés — même bien sur Biddit et notaire.be)")
+if encheres.empty:
+    st.caption("Aucune enchère sous ce seuil avec les filtres actuels.")
+else:
+    enc_table = encheres.head(50)[
+        ["source_prix", "commune", "code_postal", "type_bien", "prix", "prix_estime",
+         "surface_habitable", "peb", "ecart_estime_pct", "commune_n_comparables", "url_principale"]
+    ].rename(columns={
+        "source_prix": "Plateforme", "commune": "Commune", "code_postal": "CP", "type_bien": "Type",
+        "prix": "Mise à prix (€)", "prix_estime": "Prix estimé retenu (€)",
+        "surface_habitable": "Surface (m²)", "peb": "PEB", "ecart_estime_pct": "Écart estimé (%)",
+        "commune_n_comparables": "N ventes comparables", "url_principale": "Annonce",
+    })
+    enc_table["Plateforme"] = enc_table["Plateforme"].map(
+        {"enchere_biddit": "Biddit", "enchere_notaire": "notaire.be"})
+    st.dataframe(
+        enc_table, use_container_width=True, height=320, hide_index=True,
+        column_config={
+            "Écart estimé (%)": st.column_config.NumberColumn(format="%.0f %%"),
             "Annonce": st.column_config.LinkColumn(display_text="Voir ↗"),
         },
     )
