@@ -473,6 +473,47 @@ elif strategie == "Marchand de biens":
         "(le ticket), pas par un crédit hypothécaire supplémentaire modélisé ici — "
         "le seul taux qui joue est celui du capital de départ, traité ci-dessus.")
 
+# --------------------------------------------------- 7. suivi reel vs plan
+st.subheader("7 · Où en êtes-vous réellement ?")
+st.caption(
+    "Renseignez votre avancement à chaque visite de cette page pour voir si le rythme réel "
+    "tient le plan simulé plus haut. Rien n'est enregistré : ces valeurs ne sont pas "
+    "sauvegardées d'une session à l'autre — à noter vous-même si vous voulez les retrouver."
+)
+h1, h2 = st.columns(2)
+mois_ecoules = h1.number_input("Mois écoulés depuis le début du plan", 0, horizon * 12, 0, 1)
+if strategie == "Marchand de biens":
+    ops_reelles = h2.number_input("Opérations réellement clôturées à ce jour", 0, 500, 0, 1)
+    ops_an_requis_plan = (capital_requis + (capital_0 if emprunte else 0)) / horizon / marge_op \
+        if marge_op else float("inf")
+    if mois_ecoules > 0:
+        rythme_reel_an = ops_reelles / (mois_ecoules / 12)
+        i1, i2, i3 = st.columns(3)
+        i1.metric("Rythme requis", f"{ops_an_requis_plan:.2f} op./an")
+        i2.metric("Rythme réel constaté", f"{rythme_reel_an:.2f} op./an",
+                  delta=f"{rythme_reel_an - ops_an_requis_plan:+.2f}",
+                  delta_color="normal" if rythme_reel_an >= ops_an_requis_plan else "inverse")
+        mois_restants = horizon * 12 - mois_ecoules
+        ops_manquantes = max(ops_an_requis_plan * horizon - ops_reelles, 0)
+        rythme_necessaire_reste = (ops_manquantes / (mois_restants / 12)) if mois_restants > 0 else float("inf")
+        i3.metric("Rythme nécessaire sur le temps restant", f"{rythme_necessaire_reste:.2f} op./an",
+                  help="Ce qu'il faudrait tenir à partir de maintenant pour rattraper le plan "
+                       "initial sans changer l'horizon.")
+        if rythme_reel_an < ops_an_requis_plan * 0.8:
+            st.warning(
+                f"**Retard significatif.** Au rythme constaté, rattraper le plan initial "
+                f"demanderait {rythme_necessaire_reste:.1f} opérations/an sur le temps restant — "
+                f"au-delà de {ops_an_requis_plan:.1f}, c'est un signal pour ajuster : allonger "
+                f"l'horizon (section 1), réduire le ticket (section « Stratégie »), ou revoir "
+                f"l'objectif de revenu plutôt que de forcer la cadence.")
+        elif rythme_reel_an >= ops_an_requis_plan:
+            st.success("Le rythme réel tient ou dépasse le rythme requis par le plan initial.")
+    else:
+        st.caption("Renseignez le nombre de mois écoulés pour comparer votre rythme réel au plan.")
+else:
+    st.caption("Le suivi de cadence s'applique à la stratégie « Marchand de biens » — "
+               "la stratégie locative est un choix d'allocation initial, pas un rythme récurrent.")
+
 # ------------------------------------------------------------ méthodologie
 with st.expander("Méthodologie, hypothèses et limites — à lire avant de décider"):
     st.markdown(f"""
