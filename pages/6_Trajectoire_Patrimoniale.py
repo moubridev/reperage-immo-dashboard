@@ -92,6 +92,7 @@ st.caption(
 taux_df, _ = fetch_view(TAUX_VIEW, select="type_taux,valeur,date,source")
 olo_defaut, olo_date = taux_en_base(taux_df, "olo_10a", 3.76)
 hypo_defaut, hypo_date = taux_en_base(taux_df, "hypothecaire_be_nouveau", 3.64)
+bce_defaut, bce_date = taux_en_base(taux_df, "bce_facilite_depot", 2.50)
 
 # ---------------------------------------------------------------- paramètres
 with st.sidebar:
@@ -113,12 +114,30 @@ with st.sidebar:
              "remboursé ET servir des intérêts pendant toute la durée du plan.")
     emprunte = origine == "Emprunté"
 
-    marge_credit = st.slider("Marge du crédit au-dessus de l'OLO (points)", 0.0, 3.0, 1.0, 0.05,
+    type_taux_capital = st.radio(
+        "Référence du taux", ["BCE + marge (fixe)", "OLO + marge (indexé)"], index=0,
+        disabled=not emprunte,
+        help="Fixe : le taux est figé à la signature et ne bouge plus, quoi que fasse la BCE "
+             "ensuite. Indexé : le coût suit une référence de marché sur toute la durée — "
+             "risque de taux réel, pertinent pour un autre crédit que celui décrit ici.")
+    marge_credit = st.slider("Marge au-dessus de la référence (points)", 0.0, 3.0, 1.0, 0.05,
                              disabled=not emprunte)
-    olo = st.slider("OLO 10 ans (%)", 0.0, 8.0, float(olo_defaut), 0.05,
-                    help=f"Valeur en base : {olo_defaut:.2f} %"
-                         + (f" ({olo_date})" if olo_date else ""))
-    taux_capital = olo + marge_credit
+    if type_taux_capital == "BCE + marge (fixe)":
+        bce = st.slider("Taux BCE — facilité de dépôt (%)", 0.0, 6.0, float(bce_defaut), 0.05,
+                        disabled=not emprunte,
+                        help=f"Valeur en base : {bce_defaut:.2f} %"
+                             + (f" ({bce_date})" if bce_date else "")
+                             + ". Relevé par la BCE le 10/09/2026, effectif au 16/09/2026.")
+        taux_capital = bce + marge_credit
+        risque_taux_capital = False
+        olo = olo_defaut  # conservé pour l'affichage de sensibilité, sans effet sur taux_capital
+    else:
+        olo = st.slider("OLO 10 ans (%)", 0.0, 8.0, float(olo_defaut), 0.05,
+                        disabled=not emprunte,
+                        help=f"Valeur en base : {olo_defaut:.2f} %"
+                             + (f" ({olo_date})" if olo_date else ""))
+        taux_capital = olo + marge_credit
+        risque_taux_capital = True
 
     st.header("Stratégie")
     strategie = st.radio("Moteur de constitution du capital",
@@ -199,17 +218,24 @@ if emprunte:
     interets_an = capital_0 * taux_capital / 100
     interets_total = interets_an * horizon
     d1, d2, d3, d4 = st.columns(4)
+    reference_label = (f"BCE {bce:.2f} %" if type_taux_capital == "BCE + marge (fixe)"
+                       else f"OLO {olo:.2f} %")
     d1.metric("Taux du capital", f"{taux_capital:.2f} %",
               delta=f"{taux_capital - hypo_defaut:+.2f} pts vs crédit hypothécaire",
               delta_color="inverse",
-              help=f"OLO {olo:.2f} % + marge {marge_credit:.2f} pt. "
-                   f"Crédit hypothécaire de référence (BCE) : {hypo_defaut:.2f} %.")
+              help=f"{reference_label} + marge {marge_credit:.2f} pt. "
+                   f"Crédit hypothécaire de référence (BCE MIR) : {hypo_defaut:.2f} %.")
     d2.metric("Intérêts annuels", eur(interets_an, " €"),
               help="En bullet (intérêts seuls). Amorti, la charge serait bien supérieure.")
     d3.metric(f"Coût total sur {horizon} ans", eur(interets_total, " €"))
     d4.metric("À rembourser en plus", eur(capital_0, " €"),
               help="Le capital emprunté doit être remboursé AVANT que le patrimoine "
                    "ne devienne réellement le vôtre.")
+
+    if not risque_taux_capital:
+        st.success(
+            f"**Taux fixé à la signature, {taux_capital:.2f} %.** Aucune décision future de la "
+            f"BCE ne change plus ce coût — c'est la différence par rapport à un crédit indexé.")
 
     if taux_capital > hypo_defaut:
         st.warning(
@@ -218,6 +244,11 @@ if emprunte:
             f"{eur(capital_0)}, cet écart seul représente "
             f"{eur(capital_0 * (taux_capital - hypo_defaut) / 100 * horizon)}. "
             f"Chaque 0,25 point négocié vaut {eur(capital_0 * 0.0025 * horizon)}.")
+    elif taux_capital <= hypo_defaut:
+        st.info(
+            f"**Ce capital est moins cher qu'un crédit hypothécaire ordinaire** "
+            f"({hypo_defaut:.2f} %) : ce n'est plus la contrainte du plan. "
+            f"Voir la section 4 pour identifier la vraie contrainte.")
 
     if strategie == "Locatif à conserver":
         st.error(
@@ -373,20 +404,54 @@ if emprunte:
 
 # ------------------------------------------------ 6. sensibilité aux taux
 st.subheader("6 · Sensibilité au taux")
-st.caption("Votre crédit est indexé sur l'OLO, et l'OLO monte : il est passé de 3,51 % "
-           "en mars 2026 à 3,76 % en août. Cette sensibilité n'est pas théorique.")
-lignes = []
-for choc in (-1.0, 0.0, 1.0, 2.0):
-    t = max(olo + choc, 0.0) + (marge_credit if emprunte else 0.0)
-    cout = capital_0 * t / 100 * horizon if emprunte else 0.0
-    lignes.append({
-        "OLO": f"{max(olo + choc, 0.0):.2f} %",
-        "Taux de votre capital": f"{t:.2f} %" if emprunte else "—",
-        f"Coût total sur {horizon} ans": eur(cout, " €") if emprunte else "—",
-        "Écart vs aujourd'hui": f"{cout - capital_0 * taux_capital / 100 * horizon:+,.0f} €"
-                                .replace(",", " ") if emprunte else "—",
-    })
-st.dataframe(pd.DataFrame(lignes), hide_index=True, width="stretch")
+
+if emprunte and risque_taux_capital:
+    st.caption("Votre crédit est indexé sur l'OLO, et l'OLO monte : il est passé de 3,51 % "
+               "en mars 2026 à 3,76 % en août. Cette sensibilité n'est pas théorique.")
+    lignes = []
+    for choc in (-1.0, 0.0, 1.0, 2.0):
+        t = max(olo + choc, 0.0) + marge_credit
+        cout = capital_0 * t / 100 * horizon
+        lignes.append({
+            "OLO": f"{max(olo + choc, 0.0):.2f} %",
+            "Taux de votre capital": f"{t:.2f} %",
+            f"Coût total sur {horizon} ans": eur(cout, " €"),
+            "Écart vs aujourd'hui": eur(cout - capital_0 * taux_capital / 100 * horizon, " €")
+                                    if cout >= capital_0 * taux_capital / 100 * horizon
+                                    else f"−{eur(capital_0 * taux_capital / 100 * horizon - cout, ' €')}",
+        })
+    st.dataframe(pd.DataFrame(lignes), hide_index=True, width="stretch")
+elif emprunte and not risque_taux_capital:
+    st.success(
+        f"**Sur les {eur(capital_0)} empruntés, aucune sensibilité au taux** : {taux_capital:.2f} % "
+        f"est figé à la signature, quelle que soit la trajectoire future de la BCE. "
+        f"Ce risque, réel sur un crédit indexé, est neutralisé ici.")
+else:
+    st.caption("Capital détenu en fonds propres : aucun service de dette, donc aucune "
+               "sensibilité au taux sur ce capital.")
+
+if strategie == "Locatif à conserver":
+    st.caption(
+        f"**Le risque de taux réel de cette stratégie porte sur le crédit hypothécaire "
+        f"({taux_hypo:.2f} %), pas sur votre capital de départ.** Il finance la part "
+        f"achetée à crédit (LTV {ltv} %) et détermine directement le DSCR — voir section 3.")
+    lignes_hypo = []
+    for choc in (-1.0, 0.0, 1.0, 2.0):
+        t = max(taux_hypo + choc, 0.1)
+        a = annuite_facteur(t, duree_hypo) * 12 * 100
+        dscr_choc = (net_charges_pct / (a * ltv / 100)) if ltv > 0 else float("inf")
+        lignes_hypo.append({
+            "Taux hypothécaire": f"{t:.2f} %",
+            "Service de la dette": f"{a * ltv / 100:.2f} % /an",
+            "DSCR": f"{dscr_choc:.2f}" if np.isfinite(dscr_choc) else "∞",
+            "Bancable (≥1,2)": "✅" if dscr_choc >= 1.2 else "❌",
+        })
+    st.dataframe(pd.DataFrame(lignes_hypo), hide_index=True, width="stretch")
+elif strategie == "Marchand de biens":
+    st.caption(
+        "Dans cette stratégie, les opérations sont financées par le capital engagé "
+        "(le ticket), pas par un crédit hypothécaire supplémentaire modélisé ici — "
+        "le seul taux qui joue est celui du capital de départ, traité ci-dessus.")
 
 # ------------------------------------------------------------ méthodologie
 with st.expander("Méthodologie, hypothèses et limites — à lire avant de décider"):
