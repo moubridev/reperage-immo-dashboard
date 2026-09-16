@@ -59,6 +59,25 @@ def region_of(cp):
     return "Autre"
 
 
+def classify_source_prix(u):
+    """Distingue les sources où le prix affiché n'est PAS un prix ferme.
+
+    Trouvé le 16/09 (question utilisateur) : biddit.be (ventes judiciaires) et les
+    "opportunités immobilières" de immo.notaire.be sont des ventes aux enchères — le
+    prix affiché est une mise à prix / un prix de départ, pas le prix de vente attendu.
+    Aucune statistique belge fiable trouvée sur l'écart moyen mise à prix -> prix
+    adjugé (recherché le 16/09, rien de solide) : PAS de majoration inventée par
+    défaut (0%), mais un paramètre réglable existe pour que l'utilisateur l'ajuste
+    avec sa propre expérience de terrain plutôt qu'un chiffre halluciné."""
+    if not isinstance(u, str):
+        return "immoweb"
+    if "biddit.be" in u:
+        return "enchere_biddit"
+    if "notaire.be" in u and "opportunite" in u:
+        return "enchere_notaire"
+    return "immoweb"
+
+
 @st.cache_data(ttl=3600, show_spinner=False)
 def fetch_annonces():
     url, key = get_credentials()
@@ -108,6 +127,7 @@ def build_frame():
     # contient des variantes de casse ("Mons" / "MONS"). On normalise au moins
     # ça pour ne pas fragmenter artificiellement les comparables.
     df["commune_norm"] = df["commune"].str.strip().str.upper()
+    df["source_prix"] = df["url_principale"].apply(classify_source_prix)
 
     # Comparable marché "prix/m²" par commune, tous types/PEB confondus (pour le
     # ratio "vs marché local") — calculé sur tout le jeu de données, pas sur la
@@ -149,6 +169,7 @@ def compute_mdb_scores(
     frais_vente_pct, taux_financier_annuel_pct, duree_portage_mois, appliquer_isoc, isoc_pct,
     decote_arv_pct=8.0, frais_notaire_pct=1.6, frais_acte_eur=1300,
     tva_travaux_pct=6.0, charges_portage_mensuelles=180, prix_m2_plancher=400,
+    majoration_encheres_pct=0.0,
 ):
     """Marge d'un flip MdB, structurée comme `charge_fonciere.py` (Dev Log
     2026-08-31 : C = (R_nette − Cc − Ca − Marge − 0,5·Cc·f) / (1 + e + f)) —
@@ -218,6 +239,17 @@ def compute_mdb_scores(
     if d.empty:
         return d
 
+    # Biddit/notaire.be "opportunité" affichent une mise à prix, pas un prix de vente
+    # attendu — traiter ce prix comme ferme sous-estimerait le coût réel d'acquisition.
+    # `prix` reste le prix AFFICHÉ (tri, référence) ; `prix_acquisition` est celui
+    # utilisé dans TOUS les calculs de coût/marge ci-dessous. Majoration à 0% par défaut
+    # (aucune statistique belge fiable trouvée le 16/09 sur l'écart mise à prix -> prix
+    # adjugé) — paramètre volontairement laissé à calibrer par l'utilisateur plutôt que
+    # par un chiffre inventé.
+    d["est_enchere"] = d["source_prix"].isin(["enchere_biddit", "enchere_notaire"])
+    d["prix_acquisition"] = d["prix"] * d["est_enchere"].map(
+        {True: 1 + majoration_encheres_pct / 100, False: 1.0})
+
     n_comp = d["commune_norm"].map(comp_commune_n).fillna(0)
     comp_m2 = d["commune_norm"].map(comp_commune)
     comp_m2 = comp_m2.where(n_comp >= 5, d["region"].map(comp_region))
@@ -241,20 +273,20 @@ def compute_mdb_scores(
     # Coûts d'acquisition : droits d'enregistrement + honoraires notaire + frais d'acte.
     # Les deux derniers étaient totalement absents : ~3-4 k€ sur un bien à 150 k€,
     # soit 2-3% du deal pris directement sur la marge.
-    d["cout_enregistrement"] = d["prix"] * e
-    d["frais_acquisition"] = d["prix"] * (frais_notaire_pct / 100) + frais_acte_eur
+    d["cout_enregistrement"] = d["prix_acquisition"] * e
+    d["frais_acquisition"] = d["prix_acquisition"] * (frais_notaire_pct / 100) + frais_acte_eur
 
     # Portage : capital immobilisé = prix payé dès le jour 1 + travaux tirés
     # progressivement (approximé à la moitié du budget travaux, comme dans
     # charge_fonciere.py : "0,5·Cc·f").
-    d["cout_financier"] = (d["prix"] + 0.5 * d["cout_travaux"]) * f
+    d["cout_financier"] = (d["prix_acquisition"] + 0.5 * d["cout_travaux"]) * f
     # Charges de détention (précompte immobilier, assurance, énergie, syndic) —
     # absentes de l'ancienne formule.
     d["charges_portage"] = charges_portage_mensuelles * duree_portage_mois
     d["cout_vente"] = d["arv_brut"] * (frais_vente_pct / 100)
 
     d["marge_eur"] = (
-        d["arv_brut"] - d["prix"] - d["cout_enregistrement"] - d["frais_acquisition"]
+        d["arv_brut"] - d["prix_acquisition"] - d["cout_enregistrement"] - d["frais_acquisition"]
         - d["cout_travaux"] - d["cout_financier"] - d["charges_portage"] - d["cout_vente"]
     )
     if appliquer_isoc:
@@ -264,7 +296,7 @@ def compute_mdb_scores(
     # Capital réellement immobilisé — base de rendement bien plus parlante pour un MdB
     # que la marge rapportée à l'ARV.
     d["capital_engage"] = (
-        d["prix"] + d["cout_enregistrement"] + d["frais_acquisition"]
+        d["prix_acquisition"] + d["cout_enregistrement"] + d["frais_acquisition"]
         + d["cout_travaux"] + d["charges_portage"]
     )
     d["roi_pct"] = d["marge_eur"] / d["capital_engage"] * 100
@@ -480,6 +512,7 @@ with st.sidebar.expander("Hypothèses de calcul", expanded=False):
     decote_arv_pct = st.number_input("Décote prix demandé → prix acté (%)", min_value=0.0, max_value=40.0, value=defaults.get("decote_arv_pct", 8.0), step=1.0, help="Les comparables sont des PRIX DEMANDÉS. Mesuré sur 81 communes le 16/09 : le demandé médian vaut 1,24× l'acté Statbel (interquartile 1,12–1,38) — une partie est un effet de stock, une partie une vraie marge de négociation. 8% = prudent ; 0% = vous croyez le prix affiché.")
     cout_travaux_m2 = st.number_input("Coût travaux HTVA (€/m²)", min_value=0, max_value=3000, value=defaults.get("cout_travaux_m2", 1400), step=50, help="Corrigé le 16/09 : l'ancien forfait (850€) était sous le marché réel — sources agrégées 2026 (ABEX 1056) : 1 100-1 800 €/m² pour une rénovation lourde visant PEB A/B, jusqu'à 1 500-2 500 €/m² avec isolation/toiture/mise aux normes complètes. 1 400€ est un point médian, PAS un devis ni une grille par palier PEB — comptez vers le haut de la fourchette pour un G, vers le bas pour un E (grille par palier pas encore construite, sur le board).")
     prix_m2_plancher = st.number_input("Plancher de plausibilité prix/m² (€)", min_value=0, max_value=2000, value=defaults.get("prix_m2_plancher", 400), step=50, help="Trouvé le 16/09 : une traîne d'annonces à prix/m² implausible (jusqu'à 25 €/m²) faussait le haut du classement. Recalibré le même jour après vérification terrain : au-dessus de 400 €/m², c'est majoritairement du marché wallon dégradé réel (Charleroi, Gilly, Boussu...), pas un artefact — en dessous, aucune coupure nette n'existe entre marché réel et erreur de donnée. Sous ce seuil, une annonce est écartée du scoring, ET des comparables utilisés pour l'ARV.")
+    majoration_encheres_pct = st.number_input("Majoration prix pour Biddit/notaire.be enchères (%)", min_value=0.0, max_value=100.0, value=defaults.get("majoration_encheres_pct", 0.0), step=5.0, help="Biddit (ventes judiciaires) et les \"opportunités\" immo.notaire.be affichent une MISE À PRIX, pas un prix de vente attendu — traiter ce prix comme ferme sous-estime le coût réel. Aucune statistique belge fiable trouvée le 16/09 sur l'écart moyen mise à prix → prix adjugé : par défaut à 0% (pas de chiffre inventé). Si vous avez une expérience de terrain sur ces enchères, réglez ce paramètre vous-même — il majore le prix retenu pour TOUS les calculs de coût/marge sur ces deux sources, la colonne \"Source\" du tableau les identifie.")
     tva_travaux_pct = st.number_input("TVA travaux (%)", min_value=0.0, max_value=21.0, value=defaults.get("tva_travaux_pct", 6.0), step=15.0, help="6% pour un bâtiment de plus de 10 ans, 21% sinon. 15 points d'écart sur tout le budget travaux.")
     charges_portage_mensuelles = st.number_input("Charges de détention (€/mois)", min_value=0, max_value=3000, value=defaults.get("charges_portage_mensuelles", 180), step=20, help="Précompte immobilier, assurance, énergie, syndic. Absentes du calcul avant le 16/09.")
     frais_vente_pct = st.number_input("Frais de revente (%)", min_value=0.0, max_value=15.0, value=defaults.get("frais_vente_pct", 6.0), step=0.5, help="Agence + notaire à la revente. Absent de l'ancienne formule — c'est le bug déjà noté sur le rapport Fichaux 6.")
@@ -520,7 +553,7 @@ if st.sidebar.button("💾 Sauvegarder ces critères par défaut"):
         "appliquer_isoc": appliquer_isoc, "isoc_pct": isoc_pct,
         "seuil_go_fort": seuil_go_fort, "seuil_go": seuil_go, "seuil_limite": seuil_limite,
         "prix_m2_plancher": prix_m2_plancher, "ticket_cible_eur": ticket_cible_eur,
-        "roi_min_vise_pct": roi_min_vise_pct,
+        "roi_min_vise_pct": roi_min_vise_pct, "majoration_encheres_pct": majoration_encheres_pct,
     })
     st.sidebar.success("Enregistré ✓")
 
@@ -570,7 +603,10 @@ if transaction == "vente":
         f"ARV = comparables PEB A-B du secteur (**prix demandés**) minorés de la décote de négociation "
         f"retenue ({decote_arv_pct:.0f}%). Mesuré le 16/09 sur 81 communes : le prix demandé médian vaut "
         "**1,24× le prix réellement acté** (Statbel) — d'où la décote, et la colonne « ARV vs marché acté » "
-        "qui compare chaque ARV au marché réel de la commune. **Un tri pour prioriser les visites, jamais une offre.**"
+        "qui compare chaque ARV au marché réel de la commune. Biens 🔨 (Biddit/notaire.be enchères) : le "
+        "« Prix affiché » est une mise à prix, pas un prix de vente attendu — le « Prix retenu au calcul » "
+        "applique la majoration réglée dans la sidebar (0% par défaut, à vous de la calibrer). "
+        "**Un tri pour prioriser les visites, jamais une offre.**"
     )
 
     mdb = compute_mdb_scores_enrichi(
@@ -579,7 +615,7 @@ if transaction == "vente":
         decote_arv_pct=decote_arv_pct, frais_notaire_pct=frais_notaire_pct,
         frais_acte_eur=frais_acte_eur, tva_travaux_pct=tva_travaux_pct,
         charges_portage_mensuelles=charges_portage_mensuelles,
-        prix_m2_plancher=prix_m2_plancher,
+        prix_m2_plancher=prix_m2_plancher, majoration_encheres_pct=majoration_encheres_pct,
     )
 
     if mdb.empty:
@@ -621,15 +657,17 @@ if transaction == "vente":
         # Drapeaux que le praticien veut voir avant de se déplacer.
         show["signal"] = (
             show.get("dans_gisement_objectif", False).fillna(False).map({True: "🎯 ", False: ""})
+            + show.get("est_enchere", False).fillna(False).map({True: "🔨 Enchère ", False: ""})
             + show.get("alerte_arv", False).fillna(False).map({True: "⚠️ ARV ", False: ""})
             + show.get("dans_zone_houillere", False).fillna(False).map({True: "⛏️ Minier", False: ""})
         ).str.strip()
         top_table = show[
-            ["statut", "signal", "commune", "code_postal", "prix", "peb", "surface_habitable", "nb_chambres",
+            ["statut", "signal", "commune", "code_postal", "prix", "prix_acquisition", "peb", "surface_habitable", "nb_chambres",
              "jours_sur_marche", "arv_brut", "arv_vs_marche_pct", "cout_travaux", "capital_engage",
              "marge_eur", "marge_pct", "roi_annualise_pct", "comparable_source", "n_comparables", "url_principale"]
         ].rename(columns={
-            "statut": "Statut", "signal": "Signal", "commune": "Commune", "code_postal": "CP", "prix": "Prix (€)",
+            "statut": "Statut", "signal": "Signal", "commune": "Commune", "code_postal": "CP", "prix": "Prix affiché (€)",
+            "prix_acquisition": "Prix retenu au calcul (€)",
             "peb": "PEB", "surface_habitable": "Surface (m²)", "nb_chambres": "Ch.",
             "jours_sur_marche": "Jours en ligne", "arv_brut": "ARV (€)",
             "arv_vs_marche_pct": "ARV vs marché acté", "cout_travaux": "Travaux TVAC (€)",
