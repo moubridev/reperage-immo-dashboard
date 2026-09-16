@@ -115,29 +115,40 @@ with st.sidebar:
     emprunte = origine == "Emprunté"
 
     type_taux_capital = st.radio(
-        "Référence du taux", ["BCE + marge (fixe)", "OLO + marge (indexé)"], index=0,
+        "Référence du taux", ["BCE + marge (votre crédit, variable)", "OLO + marge (variable)",
+                              "Taux fixe (comparaison)"], index=0,
         disabled=not emprunte,
-        help="Fixe : le taux est figé à la signature et ne bouge plus, quoi que fasse la BCE "
-             "ensuite. Indexé : le coût suit une référence de marché sur toute la durée — "
-             "risque de taux réel, pertinent pour un autre crédit que celui décrit ici.")
+        help="Votre crédit réel suit la facilité de dépôt BCE + 1 point, et **varie** avec les "
+             "décisions futures de la BCE — ce n'est pas un taux figé à la signature. "
+             "L'option « Taux fixe » sert uniquement à mesurer, par comparaison, ce que "
+             "coûterait l'absence de ce risque.")
     marge_credit = st.slider("Marge au-dessus de la référence (points)", 0.0, 3.0, 1.0, 0.05,
-                             disabled=not emprunte)
-    if type_taux_capital == "BCE + marge (fixe)":
+                             disabled=not emprunte or type_taux_capital == "Taux fixe (comparaison)")
+    if type_taux_capital == "BCE + marge (votre crédit, variable)":
         bce = st.slider("Taux BCE — facilité de dépôt (%)", 0.0, 6.0, float(bce_defaut), 0.05,
                         disabled=not emprunte,
                         help=f"Valeur en base : {bce_defaut:.2f} %"
                              + (f" ({bce_date})" if bce_date else "")
                              + ". Relevé par la BCE le 10/09/2026, effectif au 16/09/2026.")
         taux_capital = bce + marge_credit
-        risque_taux_capital = False
+        risque_taux_capital = True
+        reference_nom, reference_valeur = "BCE", bce
         olo = olo_defaut  # conservé pour l'affichage de sensibilité, sans effet sur taux_capital
-    else:
+    elif type_taux_capital == "OLO + marge (variable)":
         olo = st.slider("OLO 10 ans (%)", 0.0, 8.0, float(olo_defaut), 0.05,
                         disabled=not emprunte,
                         help=f"Valeur en base : {olo_defaut:.2f} %"
                              + (f" ({olo_date})" if olo_date else ""))
         taux_capital = olo + marge_credit
         risque_taux_capital = True
+        reference_nom, reference_valeur = "OLO", olo
+        bce = bce_defaut
+    else:
+        taux_capital = st.slider("Taux fixe supposé (%)", 0.0, 8.0, float(bce_defaut + 1.0), 0.05,
+                                 disabled=not emprunte)
+        risque_taux_capital = False
+        reference_nom, reference_valeur = "fixe", taux_capital
+        olo, bce = olo_defaut, bce_defaut
 
     st.header("Stratégie")
     strategie = st.radio("Moteur de constitution du capital",
@@ -218,13 +229,13 @@ if emprunte:
     interets_an = capital_0 * taux_capital / 100
     interets_total = interets_an * horizon
     d1, d2, d3, d4 = st.columns(4)
-    reference_label = (f"BCE {bce:.2f} %" if type_taux_capital == "BCE + marge (fixe)"
-                       else f"OLO {olo:.2f} %")
     d1.metric("Taux du capital", f"{taux_capital:.2f} %",
               delta=f"{taux_capital - hypo_defaut:+.2f} pts vs crédit hypothécaire",
               delta_color="inverse",
-              help=f"{reference_label} + marge {marge_credit:.2f} pt. "
-                   f"Crédit hypothécaire de référence (BCE MIR) : {hypo_defaut:.2f} %.")
+              help=f"{reference_nom} {reference_valeur:.2f} % + marge {marge_credit:.2f} pt. "
+                   f"Crédit hypothécaire de référence (BCE MIR) : {hypo_defaut:.2f} %."
+                   if risque_taux_capital else
+                   f"Taux fixe hypothétique, à titre de comparaison uniquement.")
     d2.metric("Intérêts annuels", eur(interets_an, " €"),
               help="En bullet (intérêts seuls). Amorti, la charge serait bien supérieure.")
     d3.metric(f"Coût total sur {horizon} ans", eur(interets_total, " €"))
@@ -232,10 +243,15 @@ if emprunte:
               help="Le capital emprunté doit être remboursé AVANT que le patrimoine "
                    "ne devienne réellement le vôtre.")
 
-    if not risque_taux_capital:
-        st.success(
-            f"**Taux fixé à la signature, {taux_capital:.2f} %.** Aucune décision future de la "
-            f"BCE ne change plus ce coût — c'est la différence par rapport à un crédit indexé.")
+    if risque_taux_capital:
+        st.warning(
+            f"**Votre crédit est variable, indexé sur {reference_nom} + {marge_credit:.2f} pt.** "
+            f"Il n'est PAS figé à la signature : chaque décision future de la BCE change ce coût "
+            f"pendant toute la durée du plan. Voir la section 6 pour la sensibilité réelle.")
+    else:
+        st.caption(
+            "Scénario de comparaison uniquement : votre crédit réel est variable "
+            "(voir l'avertissement ci-dessus dans les autres options).")
 
     if taux_capital > hypo_defaut:
         st.warning(
@@ -406,26 +422,30 @@ if emprunte:
 st.subheader("6 · Sensibilité au taux")
 
 if emprunte and risque_taux_capital:
-    st.caption("Votre crédit est indexé sur l'OLO, et l'OLO monte : il est passé de 3,51 % "
-               "en mars 2026 à 3,76 % en août. Cette sensibilité n'est pas théorique.")
+    hausse_recente = ("Le taux BCE vient d'être relevé de 0,25 point le 10/09/2026 (effectif "
+                      "le 16/09) — deuxième hausse de l'année." if reference_nom == "BCE" else
+                      "L'OLO est passé de 3,51 % en mars 2026 à 3,76 % en août.")
+    st.caption(f"**Votre crédit réel suit {reference_nom} + {marge_credit:.2f} pt, variable.** "
+               f"{hausse_recente} Cette sensibilité n'est pas théorique — c'est le principal "
+               f"risque non couvert du plan.")
     lignes = []
-    for choc in (-1.0, 0.0, 1.0, 2.0):
-        t = max(olo + choc, 0.0) + marge_credit
+    for choc in (-1.0, -0.5, 0.0, 0.5, 1.0, 2.0):
+        ref_choc = max(reference_valeur + choc, 0.0)
+        t = ref_choc + marge_credit
         cout = capital_0 * t / 100 * horizon
+        cout_actuel = capital_0 * taux_capital / 100 * horizon
         lignes.append({
-            "OLO": f"{max(olo + choc, 0.0):.2f} %",
+            reference_nom: f"{ref_choc:.2f} %",
             "Taux de votre capital": f"{t:.2f} %",
             f"Coût total sur {horizon} ans": eur(cout, " €"),
-            "Écart vs aujourd'hui": eur(cout - capital_0 * taux_capital / 100 * horizon, " €")
-                                    if cout >= capital_0 * taux_capital / 100 * horizon
-                                    else f"−{eur(capital_0 * taux_capital / 100 * horizon - cout, ' €')}",
+            "Écart vs aujourd'hui": (eur(cout - cout_actuel, " €") if cout >= cout_actuel
+                                     else f"−{eur(cout_actuel - cout, ' €')}"),
         })
     st.dataframe(pd.DataFrame(lignes), hide_index=True, width="stretch")
 elif emprunte and not risque_taux_capital:
-    st.success(
-        f"**Sur les {eur(capital_0)} empruntés, aucune sensibilité au taux** : {taux_capital:.2f} % "
-        f"est figé à la signature, quelle que soit la trajectoire future de la BCE. "
-        f"Ce risque, réel sur un crédit indexé, est neutralisé ici.")
+    st.info(
+        f"**Scénario de comparaison :** à {taux_capital:.2f} % fixe, aucune sensibilité au "
+        f"taux. Ce n'est pas votre crédit réel — il est variable (voir les deux autres options).")
 else:
     st.caption("Capital détenu en fonds propres : aucun service de dette, donc aucune "
                "sensibilité au taux sur ce capital.")
@@ -484,9 +504,15 @@ en Belgique — ferait mécaniquement bondir le capital requis d'environ 30 %.
 **Ce que la simulation modélise, et ce qu'elle ignore**
 - Modélisé : aléa sur le nombre d'opérations (loi de Poisson), sur leur réussite, et — en locatif —
   sur l'appréciation des prix (volatilité de 4 %/an).
-- **Non modélisé** : une crise de liquidité (ne pas pouvoir revendre au moment voulu), une
-  vacance locative prolongée, un dépassement de travaux corrélé entre opérations, un changement
-  de politique de crédit bancaire. Les scénarios défavorables réels sont **corrélés** ;
+- **Non modélisé — et c'est important si votre crédit est variable** : la trajectoire de la
+  section 4 tient le taux du capital **constant** sur tout l'horizon, au niveau choisi en
+  section 2. Or votre crédit réel suit la BCE et **varie** : c'est la section 6 (sensibilité),
+  pas la section 4, qui montre l'ampleur réelle de ce risque. Aucune volatilité future n'est
+  simulée ici faute d'historique BCE suffisamment long et vérifié pour la calibrer honnêtement —
+  mieux vaut l'absence d'un chiffre que d'en inventer un.
+- **Non modélisé également** : une crise de liquidité (ne pas pouvoir revendre au moment voulu),
+  une vacance locative prolongée, un dépassement de travaux corrélé entre opérations, un
+  changement de politique de crédit bancaire. Les scénarios défavorables réels sont **corrélés** ;
   la simulation les traite comme indépendants et **sous-estime donc la queue de risque**.
 
 **Limites héritées des données sources**
