@@ -644,6 +644,20 @@ k5.metric("En ligne depuis (médiane)", f"{int(f['jours_sur_marche'].median())} 
 
 st.markdown("---")
 
+# Remonté ici le 16/09 (plan d'action sourcing) : le filtre "jours en ligne" existait
+# déjà dans "Plus de filtres" mais restait invisible pour ce cas d'usage précis —
+# revenir régulièrement voir les NOUVELLES pépites sans rescanner tout le classement.
+# S'applique aux trois sections de sourcing ci-dessous (sous le marché, enchères,
+# location) ET à l'analyse MdB, la carte et la liste en bas de page.
+nouveaute_jours = st.select_slider(
+    "🆕 Sourcing : limiter tout ce qui suit aux annonces publiées depuis",
+    options=["Pas de limite", 7, 3, 1], value="Pas de limite",
+    help="S'applique à toutes les sections ci-dessous (sous le marché, enchères, "
+         "location, analyse MdB, carte, liste). Pour revenir uniquement sur les "
+         "nouveautés depuis votre dernière visite.")
+if nouveaute_jours != "Pas de limite":
+    f = f[f["jours_sur_marche"] <= nouveaute_jours]
+
 # ------------------------------------------------------- biens sous le marché
 # Remis en avant le 16/09 (feedback utilisateur) : le signal simple et robuste
 # "ce bien se vend moins cher que le marché local" s'était fait enterrer sous
