@@ -59,6 +59,28 @@ def region_of(cp):
     return "Autre"
 
 
+NON_RESIDENTIEL_SLUGS = ("mixed-use", "commercial", "industrial", "office", "warehouse",
+                         "apartment-block", "hotel", "shop", "showroom", "garage",
+                         "parking", "land", "plot", "farm", "factory")
+
+
+def type_bien_fiable(type_bien, url):
+    """Corrige le type de bien via le slug d'URL Immoweb quand il contredit `type_bien`.
+
+    Trouvé le 16/09 en analysant le signal "sous le marché" (demande utilisateur) :
+    385 annonces taguées maison/appartement pointent vers des URL "mixed-use-building",
+    "farm", etc. — un immeuble mixte commerce/habitation comparé à une médiane purement
+    résidentielle n'est pas une pépite, c'est un artefact de mauvais étiquetage. Ces
+    biens remontaient en tête du classement "sous le marché" précisément À CAUSE de
+    cette erreur (le commercial est structurellement moins cher au m² que l'habitable)."""
+    if type_bien not in ("maison", "appartement") or not isinstance(url, str):
+        return type_bien
+    for s in NON_RESIDENTIEL_SLUGS:
+        if f"/{s}" in url or f"classified/{s}" in url:
+            return "autre"
+    return type_bien
+
+
 def classify_source_prix(u):
     """Distingue les sources où le prix affiché n'est PAS un prix ferme.
 
@@ -120,6 +142,7 @@ def build_frame():
     df["prix_m2"] = (df["prix"] / df["surface_habitable"]).where(df["surface_habitable"] > 0)
     df["region"] = df["code_postal"].apply(region_of)
     df["type_bien"] = df["type_bien"].fillna("autre")
+    df["type_bien"] = [type_bien_fiable(t, u) for t, u in zip(df["type_bien"], df["url_principale"])]
     df["commune"] = df["commune"].fillna("?")
     df["peb"] = df["peb"].fillna("n.c.")
     # `code_ins` est NULL sur ~98% de la base (Dev Log 2026-08-31) : le seul
@@ -633,6 +656,12 @@ comp_min = st.number_input("Nombre minimum de ventes comparables dans la commune
                            help="En dessous, la médiane communale repose sur trop peu de ventes "
                                 "pour être fiable — le bien est écarté plutôt que d'afficher un "
                                 "écart trompeur.")
+inclure_encheres = st.checkbox(
+    "Inclure Biddit / notaire.be enchères", value=False,
+    help="Trouvé le 16/09 en analysant ce classement : les enchères affichent une mise à prix, "
+         "pas un prix de vente attendu — elles représentaient 50% du top 20 par écart alors "
+         "qu'elles ne sont que 6% du gisement total. Décochées par défaut pour garder ce "
+         "classement fiable ; cochez pour les voir quand même, repérables au drapeau 🔨.")
 # Même garde-fou de plausibilité que le scoring MdB (type de bien, surface, prix/m² —
 # trouvés le 16/09) : sans lui ce tableau, censé être PLUS fiable que le scoring MdB,
 # hériterait du même biais (maisons à 800-2 500 €, terrains/garages mal catégorisés).
@@ -647,17 +676,34 @@ sous_marche = f[
     & f["ecart_vs_marche_pct"].notna()
     & (f["ecart_vs_marche_pct"] <= ecart_seuil)
     & (f["commune_n_comparables"] >= comp_min)
+    & (inclure_encheres | (f["source_prix"] == "immoweb"))
 ].sort_values("ecart_vs_marche_pct").copy()
 
+# Doublons cross-source : la même vente judiciaire ou "opportunité" apparaît souvent
+# à la fois sur biddit.be et immo.notaire.be — trouvé le 16/09, 268 groupes sur ce
+# classement (ex. Eupen 50 000€/120m² listé deux fois). On ne garde qu'une ligne par
+# combinaison commune+prix+surface plutôt que de compter deux fois la même opportunité.
+sous_marche["dup_key"] = (
+    sous_marche["commune_norm"] + "_" + sous_marche["prix"].astype(str)
+    + "_" + sous_marche["surface_habitable"].astype(str)
+)
+n_avant_dedup = len(sous_marche)
+sous_marche = sous_marche.drop_duplicates("dup_key")
+n_doublons = n_avant_dedup - len(sous_marche)
+
 st.metric("Biens sous le marché", f"{len(sous_marche):,}".replace(",", " "))
+if n_doublons:
+    st.caption(f"({n_doublons} doublons cross-source retirés — même bien annoncé sur plusieurs plateformes)")
 if sous_marche.empty:
     st.info("Aucun bien sous ce seuil avec les filtres actuels.")
 else:
+    sous_marche["signal"] = sous_marche["source_prix"].isin(
+        ["enchere_biddit", "enchere_notaire"]).map({True: "🔨", False: ""})
     sm_table = sous_marche.head(100)[
-        ["commune", "code_postal", "type_bien", "prix", "surface_habitable", "peb",
+        ["signal", "commune", "code_postal", "type_bien", "prix", "surface_habitable", "peb",
          "jours_sur_marche", "ecart_vs_marche_pct", "commune_n_comparables", "url_principale"]
     ].rename(columns={
-        "commune": "Commune", "code_postal": "CP", "type_bien": "Type", "prix": "Prix (€)",
+        "signal": "", "commune": "Commune", "code_postal": "CP", "type_bien": "Type", "prix": "Prix (€)",
         "surface_habitable": "Surface (m²)", "peb": "PEB", "jours_sur_marche": "Jours en ligne",
         "ecart_vs_marche_pct": "vs marché (%)", "commune_n_comparables": "N ventes comparables",
         "url_principale": "Annonce",
