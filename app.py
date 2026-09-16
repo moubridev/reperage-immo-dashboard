@@ -189,21 +189,29 @@ PEB_RENOVES = {"A++", "A+", "A", "B"}
 
 @st.cache_data(ttl=3600, show_spinner=False)
 def fetch_contexte_mdb():
-    """Contexte commune utile à la décision MdB : prix réellement réalisé (Statbel,
-    actes notariés) pour recouper l'ARV, et risque d'affaissement minier."""
+    """Contexte commune utile à la décision MdB/location : prix réellement réalisé
+    (Statbel, actes notariés) pour recouper l'ARV, risque d'affaissement minier, et
+    (ajouté le 16/09 — distinguer location vs achat-revente) DSCR et rendement net-net
+    par type de bien, depuis `communes_rendement_locatif` via `v_dashboard_communes`."""
     url, key = get_credentials()
     headers = {"apikey": key, "Authorization": f"Bearer {key}"}
     r = requests.get(
         f"{url}/rest/v1/v_dashboard_communes",
         headers=headers,
-        params={"select": "nom_commune,prix_median_maison,dans_zone_houillere,anciennete_active_jours", "limit": 1000},
+        params={"select": "nom_commune,prix_median_maison,dans_zone_houillere,anciennete_active_jours,"
+                          "dscr_maison,dscr_appartement,rendement_net_net_maison_pct,"
+                          "rendement_net_net_appartement_pct,cash_flow_maison_eur,cash_flow_appartement_eur",
+                "limit": 1000},
         timeout=30,
     )
     r.raise_for_status()
     ctx = pd.DataFrame(r.json())
     if not ctx.empty:
         ctx["commune_norm"] = ctx["nom_commune"].str.strip().str.upper()
-        for c in ["prix_median_maison", "anciennete_active_jours"]:
+        num_cols = ["prix_median_maison", "anciennete_active_jours", "dscr_maison", "dscr_appartement",
+                    "rendement_net_net_maison_pct", "rendement_net_net_appartement_pct",
+                    "cash_flow_maison_eur", "cash_flow_appartement_eur"]
+        for c in num_cols:
             ctx[c] = pd.to_numeric(ctx[c], errors="coerce")
     return ctx
 
@@ -718,9 +726,83 @@ else:
 
 st.markdown("---")
 
+# --------------------------------------------------- propices a la location
+# Construit le 16/09 (demande utilisateur : "il faut distinguer les biens propices
+# à la location et ceux propices à l'achat-revente"). Logique différente de "sous le
+# marché" et du scoring MdB ci-dessous : ici, la question n'est pas la décote à
+# l'achat mais "le loyer couvre-t-il la dette dans CETTE commune, pour CE type de
+# bien ?" (DSCR de `communes_rendement_locatif`, par type maison/appartement — pas
+# une moyenne commune tous types confondus). Un bien déjà en état correct (pas besoin
+# de gros travaux) est requis : contrairement au flip, la location suppose un usage
+# rapide, pas un chantier de rénovation lourde.
+
+if transaction == "vente":
+    st.subheader("🏠 Propices à la location")
+    st.caption(
+        "DSCR (revenu locatif net / service de la dette à 80% LTV, 20 ans) mesuré par "
+        "`communes_rendement_locatif` — PAR TYPE DE BIEN, pas une moyenne commune. "
+        "Restreint aux PEB A-E (pas de gros chantier avant de louer). ⭐ = aussi sous le "
+        "marché local (double intérêt : plus-value à l'achat ET loyer qui tient)."
+    )
+    dscr_min = st.slider("DSCR minimum (1,0 = le loyer couvre exactement la dette)", 0.0, 2.0, 1.0, 0.05)
+
+    ctx_loc = fetch_contexte_mdb()
+    if ctx_loc.empty:
+        st.info("Données de rendement locatif indisponibles.")
+    else:
+        loc_cand = f[
+            f["type_bien"].isin(["maison", "appartement"])
+            & sous_marche_surface_ok
+            & (f["prix_m2"] >= prix_m2_plancher)
+            & f["peb"].isin(["A++", "A+", "A", "B", "C", "D", "E"])
+        ].merge(ctx_loc, on="commune_norm", how="left", suffixes=("", "_ctx"))
+        loc_cand["dscr"] = loc_cand["type_bien"].map({"maison": "dscr_maison", "appartement": "dscr_appartement"})
+        loc_cand["dscr"] = loc_cand.apply(lambda r: r.get(r["dscr"]), axis=1)
+        loc_cand["cash_flow_estime"] = loc_cand.apply(
+            lambda r: r.get("cash_flow_maison_eur" if r["type_bien"] == "maison" else "cash_flow_appartement_eur"),
+            axis=1)
+        loc_cand = loc_cand[loc_cand["dscr"].notna() & (loc_cand["dscr"] >= dscr_min)]
+        loc_cand["double_interet"] = loc_cand["ecart_vs_marche_pct"] <= ecart_seuil
+
+        st.metric("Biens propices à la location", f"{len(loc_cand):,}".replace(",", " "),
+                  help=f"{int(loc_cand['double_interet'].sum())} sont aussi sous le marché (⭐).")
+        if loc_cand.empty:
+            st.info("Aucun bien avec ce DSCR minimum et les filtres actuels — les communes "
+                    "bancables sont peu nombreuses aujourd'hui (voir Trajectoire patrimoniale).")
+        else:
+            loc_cand = loc_cand.sort_values("dscr", ascending=False)
+            loc_cand["signal"] = loc_cand["double_interet"].map({True: "⭐", False: ""})
+            loc_table = loc_cand.head(100)[
+                ["signal", "commune", "code_postal", "type_bien", "prix", "surface_habitable", "peb",
+                 "dscr", "cash_flow_estime", "ecart_vs_marche_pct", "url_principale"]
+            ].rename(columns={
+                "signal": "", "commune": "Commune", "code_postal": "CP", "type_bien": "Type",
+                "prix": "Prix (€)", "surface_habitable": "Surface (m²)", "peb": "PEB",
+                "dscr": "DSCR (commune)", "cash_flow_estime": "Cash-flow estimé (€/mois, commune)",
+                "ecart_vs_marche_pct": "vs marché (%)", "url_principale": "Annonce",
+            })
+            st.dataframe(
+                loc_table, use_container_width=True, height=380, hide_index=True,
+                column_config={
+                    "DSCR (commune)": st.column_config.NumberColumn(format="%.2f"),
+                    "vs marché (%)": st.column_config.NumberColumn(format="%.0f %%"),
+                    "Annonce": st.column_config.LinkColumn(display_text="Voir ↗"),
+                },
+            )
+            st.caption("DSCR et cash-flow sont des moyennes COMMUNE/TYPE, pas calculés bien par "
+                       "bien (prix propre à l'annonce, taux, LTV réels) — un point de départ pour "
+                       "prioriser où chercher, pas un DSCR individuel. Voir *Trajectoire "
+                       "patrimoniale* pour simuler un scénario précis.")
+
+    st.markdown("---")
+
 # ---------------------------------------------------------------- analyse MdB
 
 if transaction == "vente":
+    st.caption("**Analyse ci-dessous : propice à l'achat-revente** (achat dégradé → "
+               "rénovation → revente) — logique différente de la location ci-dessus : "
+               "ici on cherche l'écart entre le prix d'achat dégradé et l'ARV après travaux, "
+               "pas un loyer qui tient tout de suite.")
     st.subheader("🎯 Analyse approfondie MdB — achat dégradé → rénovation → revente")
     st.caption(
         "Étape suivante, optionnelle : simule une rénovation complète plutôt qu'une simple "
