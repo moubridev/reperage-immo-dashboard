@@ -148,7 +148,7 @@ def compute_mdb_scores(
     df_scope, df_all, peb_cibles, taux_enregistrement_pct, cout_travaux_m2,
     frais_vente_pct, taux_financier_annuel_pct, duree_portage_mois, appliquer_isoc, isoc_pct,
     decote_arv_pct=8.0, frais_notaire_pct=1.6, frais_acte_eur=1300,
-    tva_travaux_pct=6.0, charges_portage_mensuelles=180, prix_m2_plancher=750,
+    tva_travaux_pct=6.0, charges_portage_mensuelles=180, prix_m2_plancher=400,
 ):
     """Marge d'un flip MdB, structurée comme `charge_fonciere.py` (Dev Log
     2026-08-31 : C = (R_nette − Cc − Ca − Marge − 0,5·Cc·f) / (1 + e + f)) —
@@ -165,7 +165,23 @@ def compute_mdb_scores(
     # ⚠️ Comparables et scope limités à la VENTE — un loyer mensuel (ex. 2100 €)
     # traité comme un prix d'achat produirait un prix/m² comparable délirant et
     # fausserait l'ARV même pour les biens à vendre analysés en même temps.
-    comp_base = df_all[df_all["peb"].isin(PEB_RENOVES) & (df_all["type_transaction"] == "vente")]
+    #
+    # Trouvé le 16/09 en vérifiant l'ARV sur demande utilisateur : la base de comparables
+    # n'était filtrée NI sur le type de bien NI sur la plausibilité du prix. 6,8% des
+    # comparables (261/3841) étaient des biens commerciaux/industriels/immeubles de
+    # rapport — sans rapport avec le prix/m² d'une maison ou d'un appartement rénové —
+    # et faisaient dévier l'ARV jusqu'à +92%/-38% dans les communes à peu de comparables.
+    # Corrigé en appliquant le MÊME filtre type de bien + plancher de plausibilité que
+    # sur le scope `d` ci-dessous : la base de comparaison et le bien évalué doivent
+    # appartenir au même univers.
+    comp_prix_m2_ok = (df_all["prix"] / df_all["surface_habitable"]).where(
+        df_all["surface_habitable"] > 0) >= prix_m2_plancher
+    comp_base = df_all[
+        df_all["peb"].isin(PEB_RENOVES) & (df_all["type_transaction"] == "vente")
+        & df_all["type_bien"].isin(["maison", "appartement"])
+        & df_all["surface_habitable"].between(15, 600)
+        & comp_prix_m2_ok
+    ]
     comp_commune = comp_base.groupby("commune_norm")["prix_m2"].median()
     comp_region = comp_base.groupby("region")["prix_m2"].median()
     comp_commune_n = comp_base.groupby("commune_norm")["prix_m2"].count()
@@ -179,13 +195,16 @@ def compute_mdb_scores(
         | (df_scope["type_bien"].eq("maison") & df_scope["surface_habitable"].between(25, 600))
     )
     # Garde-fou plausibilité n°2, trouvé le 16/09 en creusant les meilleures opportunités
-    # du filtre 🎯 objectif : une traîne de prix/m² implausibles (jusqu'à 25 €/m² —
-    # bien en dessous même du 1er centile réel, ~425 €/m² sur les PEB E/F/G) faussait le
-    # haut du classement. Sur-représentés chez les enchères (biddit.be, notaire.be
-    # "opportunité" — prix de départ, pas prix de vente attendu) mais 70 % restent des
-    # annonces Immoweb classiques (erreur de saisie probable, ex. un zéro manquant) :
-    # pas un bug de source unique, un vrai trou de plausibilité sur le PRIX, en plus de
-    # celui déjà couvert sur la SURFACE ci-dessus.
+    # du filtre 🎯 objectif : une traîne de prix/m² implausibles (jusqu'à 25 €/m²)
+    # faussait le haut du classement. Sur-représentés chez les enchères (biddit.be,
+    # notaire.be "opportunité" — prix de départ, pas prix de vente attendu) mais 70%
+    # restent des annonces Immoweb classiques (erreur de saisie probable). Seuil recalibré
+    # le même jour après vérification manuelle par l'utilisateur : entre 400 et 750 €/m²,
+    # la population est majoritairement du marché réel (Charleroi, Gilly, Boussu,
+    # Marchienne-au-Pont — marchés wallons dégradés authentiques), pas un artefact. En
+    # dessous, aucune coupure statistique nette n'existe (le mélange auction/erreur/marché
+    # réel est continu) — le seuil de 400 €/m² est donc une estimation prudente, pas une
+    # frontière prouvée : à ajuster si le terrain montre autre chose.
     prix_m2_ok = (df_scope["prix"] / df_scope["surface_habitable"]).where(
         df_scope["surface_habitable"] > 0) >= prix_m2_plancher
     d = df_scope[
@@ -459,8 +478,8 @@ with st.sidebar.expander("Hypothèses de calcul", expanded=False):
     frais_notaire_pct = st.number_input("Honoraires notaire (%)", min_value=0.0, max_value=5.0, value=defaults.get("frais_notaire_pct", 1.6), step=0.1, help="Honoraires dégressifs, hors droits d'enregistrement. Étaient totalement absents du calcul avant le 16/09.")
     frais_acte_eur = st.number_input("Frais d'acte fixes (€)", min_value=0, max_value=10000, value=defaults.get("frais_acte_eur", 1300), step=100, help="Recherches, formalités, transcription hypothécaire.")
     decote_arv_pct = st.number_input("Décote prix demandé → prix acté (%)", min_value=0.0, max_value=40.0, value=defaults.get("decote_arv_pct", 8.0), step=1.0, help="Les comparables sont des PRIX DEMANDÉS. Mesuré sur 81 communes le 16/09 : le demandé médian vaut 1,24× l'acté Statbel (interquartile 1,12–1,38) — une partie est un effet de stock, une partie une vraie marge de négociation. 8% = prudent ; 0% = vous croyez le prix affiché.")
-    cout_travaux_m2 = st.number_input("Coût travaux HTVA (€/m²)", min_value=0, max_value=3000, value=defaults.get("cout_travaux_m2", 850), step=50, help="Hors TVA, forfait unique quel que soit l'écart PEB — à affiner par palier si besoin.")
-    prix_m2_plancher = st.number_input("Plancher de plausibilité prix/m² (€)", min_value=0, max_value=2000, value=defaults.get("prix_m2_plancher", 750), step=50, help="Trouvé le 16/09 : une traîne d'annonces à prix/m² implausible (jusqu'à 25 €/m², contre ~425 €/m² au 1er centile réel du marché PEB E/F/G) faussait le haut du classement — enchères judiciaires (prix de départ, pas prix de vente réel) et erreurs de saisie confondues. Sous ce seuil, une annonce est écartée du scoring.")
+    cout_travaux_m2 = st.number_input("Coût travaux HTVA (€/m²)", min_value=0, max_value=3000, value=defaults.get("cout_travaux_m2", 1400), step=50, help="Corrigé le 16/09 : l'ancien forfait (850€) était sous le marché réel — sources agrégées 2026 (ABEX 1056) : 1 100-1 800 €/m² pour une rénovation lourde visant PEB A/B, jusqu'à 1 500-2 500 €/m² avec isolation/toiture/mise aux normes complètes. 1 400€ est un point médian, PAS un devis ni une grille par palier PEB — comptez vers le haut de la fourchette pour un G, vers le bas pour un E (grille par palier pas encore construite, sur le board).")
+    prix_m2_plancher = st.number_input("Plancher de plausibilité prix/m² (€)", min_value=0, max_value=2000, value=defaults.get("prix_m2_plancher", 400), step=50, help="Trouvé le 16/09 : une traîne d'annonces à prix/m² implausible (jusqu'à 25 €/m²) faussait le haut du classement. Recalibré le même jour après vérification terrain : au-dessus de 400 €/m², c'est majoritairement du marché wallon dégradé réel (Charleroi, Gilly, Boussu...), pas un artefact — en dessous, aucune coupure nette n'existe entre marché réel et erreur de donnée. Sous ce seuil, une annonce est écartée du scoring, ET des comparables utilisés pour l'ARV.")
     tva_travaux_pct = st.number_input("TVA travaux (%)", min_value=0.0, max_value=21.0, value=defaults.get("tva_travaux_pct", 6.0), step=15.0, help="6% pour un bâtiment de plus de 10 ans, 21% sinon. 15 points d'écart sur tout le budget travaux.")
     charges_portage_mensuelles = st.number_input("Charges de détention (€/mois)", min_value=0, max_value=3000, value=defaults.get("charges_portage_mensuelles", 180), step=20, help="Précompte immobilier, assurance, énergie, syndic. Absentes du calcul avant le 16/09.")
     frais_vente_pct = st.number_input("Frais de revente (%)", min_value=0.0, max_value=15.0, value=defaults.get("frais_vente_pct", 6.0), step=0.5, help="Agence + notaire à la revente. Absent de l'ancienne formule — c'est le bug déjà noté sur le rapport Fichaux 6.")
@@ -500,6 +519,8 @@ if st.sidebar.button("💾 Sauvegarder ces critères par défaut"):
         "taux_financier_annuel_pct": taux_financier_annuel_pct, "duree_portage_mois": duree_portage_mois,
         "appliquer_isoc": appliquer_isoc, "isoc_pct": isoc_pct,
         "seuil_go_fort": seuil_go_fort, "seuil_go": seuil_go, "seuil_limite": seuil_limite,
+        "prix_m2_plancher": prix_m2_plancher, "ticket_cible_eur": ticket_cible_eur,
+        "roi_min_vise_pct": roi_min_vise_pct,
     })
     st.sidebar.success("Enregistré ✓")
 
