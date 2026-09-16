@@ -239,13 +239,22 @@ with c1:
                  "différentes (recensement vs registre) : c'est un ordre de grandeur, pas une tendance "
                  "mesurée — on ne peut pas voir d'inflexion.".replace(",", " "),
         )
-        g2.metric(
-            "Solde migratoire",
-            f"{dr['solde_migratoire']:+.1f}" if pd.notna(dr["solde_migratoire"]) else "n.c.",
-            help="Entrées − sorties (source IWEPS). Une commune qui grandit par migration n'a pas le même "
-                 "profil qu'une commune qui grandit par natalité — mais le solde naturel (naissances − décès) "
-                 "est absent de la base, la décomposition est donc incomplète.",
-        )
+        naturel = dr.get("solde_naturel")
+        migratoire = dr.get("solde_migratoire")
+        if pd.notna(naturel):
+            moteur = "natalité" if naturel > 0 and (pd.isna(migratoire) or naturel > migratoire) else "migration"
+            g2.metric(
+                "Solde naturel / migratoire",
+                f"{naturel:+.0f} / {migratoire:+.1f}" if pd.notna(migratoire) else f"{naturel:+.0f} / n.c.",
+                help=f"Naissances − décès (Statbel 2025) / Entrées − sorties (IWEPS). "
+                     f"Décomposition ajoutée le 16/09 (`solde_naturel` était vide à 100% avant). "
+                     f"Moteur dominant ici : **{moteur}** — une commune qui grandit par migration "
+                     "(attractivité, prix, emploi) n'a pas le même profil ni la même durabilité qu'une "
+                     "commune qui grandit par natalité (population jeune déjà installée).",
+            )
+        else:
+            g2.metric("Solde migratoire", f"{migratoire:+.1f}" if pd.notna(migratoire) else "n.c.",
+                      help="Entrées − sorties (IWEPS). Solde naturel non disponible pour cette commune.")
         g3.metric(
             "Ménages suppl. estimés",
             f"{dr['menages_supplementaires_estimes']:+,.0f}".replace(",", " ") if pd.notna(dr["menages_supplementaires_estimes"]) else "n.c.",
@@ -264,6 +273,21 @@ with c1:
                  "et le stock vacant absorbable n'est pas déduit. Signal relatif entre communes, "
                  "jamais un déficit chiffré.".replace(",", " "),
         )
+
+        if pd.notna(dr.get("pct_isoles_2026")):
+            st.caption(
+                f"**Typologie des ménages (Statbel, 01/01/2026 — {int(dr['nb_menages_2026']):,} ménages privés)** : "
+                f"isolés {dr['pct_isoles_2026']:.0f} % · "
+                f"couples mariés avec enfant(s) {dr['pct_couples_maries_avec_enfant_2026']:.0f} % · "
+                f"couples mariés sans enfant {dr['pct_couples_maries_sans_enfant_2026']:.0f} % · "
+                f"couples non-mariés avec enfant(s) {dr['pct_couples_nonmaries_avec_enfant_2026']:.0f} % · "
+                f"couples non-mariés sans enfant {dr['pct_couples_nonmaries_sans_enfant_2026']:.0f} % · "
+                f"monoparentaux {dr['pct_monoparental_2026']:.0f} % · "
+                f"autres {dr['pct_autres_types_2026']:.0f} %. "
+                "Couvre désormais Bruxelles (source nationale, remplace l'ancienne source WalStat "
+                "Wallonie-seule pour ce résumé) — isolés/monoparentaux non répartis par genre ici."
+                .replace(",", " ")
+            )
 
     st.markdown("**Marché élargi** (hors score — indicatif)")
     e1, e2, e3, e4 = st.columns(4)
