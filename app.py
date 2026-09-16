@@ -148,7 +148,7 @@ def compute_mdb_scores(
     df_scope, df_all, peb_cibles, taux_enregistrement_pct, cout_travaux_m2,
     frais_vente_pct, taux_financier_annuel_pct, duree_portage_mois, appliquer_isoc, isoc_pct,
     decote_arv_pct=8.0, frais_notaire_pct=1.6, frais_acte_eur=1300,
-    tva_travaux_pct=6.0, charges_portage_mensuelles=180,
+    tva_travaux_pct=6.0, charges_portage_mensuelles=180, prix_m2_plancher=750,
 ):
     """Marge d'un flip MdB, structurée comme `charge_fonciere.py` (Dev Log
     2026-08-31 : C = (R_nette − Cc − Ca − Marge − 0,5·Cc·f) / (1 + e + f)) —
@@ -178,12 +178,23 @@ def compute_mdb_scores(
         (df_scope["type_bien"].eq("appartement") & df_scope["surface_habitable"].between(15, 350))
         | (df_scope["type_bien"].eq("maison") & df_scope["surface_habitable"].between(25, 600))
     )
+    # Garde-fou plausibilité n°2, trouvé le 16/09 en creusant les meilleures opportunités
+    # du filtre 🎯 objectif : une traîne de prix/m² implausibles (jusqu'à 25 €/m² —
+    # bien en dessous même du 1er centile réel, ~425 €/m² sur les PEB E/F/G) faussait le
+    # haut du classement. Sur-représentés chez les enchères (biddit.be, notaire.be
+    # "opportunité" — prix de départ, pas prix de vente attendu) mais 70 % restent des
+    # annonces Immoweb classiques (erreur de saisie probable, ex. un zéro manquant) :
+    # pas un bug de source unique, un vrai trou de plausibilité sur le PRIX, en plus de
+    # celui déjà couvert sur la SURFACE ci-dessus.
+    prix_m2_ok = (df_scope["prix"] / df_scope["surface_habitable"]).where(
+        df_scope["surface_habitable"] > 0) >= prix_m2_plancher
     d = df_scope[
         (df_scope["type_transaction"] == "vente")
         & df_scope["type_bien"].isin(["maison", "appartement"])
         & df_scope["peb"].isin(peb_cibles)
         & df_scope["prix"].notna()
         & surface_ok
+        & prix_m2_ok
     ].copy()
     if d.empty:
         return d
@@ -449,6 +460,7 @@ with st.sidebar.expander("Hypothèses de calcul", expanded=False):
     frais_acte_eur = st.number_input("Frais d'acte fixes (€)", min_value=0, max_value=10000, value=defaults.get("frais_acte_eur", 1300), step=100, help="Recherches, formalités, transcription hypothécaire.")
     decote_arv_pct = st.number_input("Décote prix demandé → prix acté (%)", min_value=0.0, max_value=40.0, value=defaults.get("decote_arv_pct", 8.0), step=1.0, help="Les comparables sont des PRIX DEMANDÉS. Mesuré sur 81 communes le 16/09 : le demandé médian vaut 1,24× l'acté Statbel (interquartile 1,12–1,38) — une partie est un effet de stock, une partie une vraie marge de négociation. 8% = prudent ; 0% = vous croyez le prix affiché.")
     cout_travaux_m2 = st.number_input("Coût travaux HTVA (€/m²)", min_value=0, max_value=3000, value=defaults.get("cout_travaux_m2", 850), step=50, help="Hors TVA, forfait unique quel que soit l'écart PEB — à affiner par palier si besoin.")
+    prix_m2_plancher = st.number_input("Plancher de plausibilité prix/m² (€)", min_value=0, max_value=2000, value=defaults.get("prix_m2_plancher", 750), step=50, help="Trouvé le 16/09 : une traîne d'annonces à prix/m² implausible (jusqu'à 25 €/m², contre ~425 €/m² au 1er centile réel du marché PEB E/F/G) faussait le haut du classement — enchères judiciaires (prix de départ, pas prix de vente réel) et erreurs de saisie confondues. Sous ce seuil, une annonce est écartée du scoring.")
     tva_travaux_pct = st.number_input("TVA travaux (%)", min_value=0.0, max_value=21.0, value=defaults.get("tva_travaux_pct", 6.0), step=15.0, help="6% pour un bâtiment de plus de 10 ans, 21% sinon. 15 points d'écart sur tout le budget travaux.")
     charges_portage_mensuelles = st.number_input("Charges de détention (€/mois)", min_value=0, max_value=3000, value=defaults.get("charges_portage_mensuelles", 180), step=20, help="Précompte immobilier, assurance, énergie, syndic. Absentes du calcul avant le 16/09.")
     frais_vente_pct = st.number_input("Frais de revente (%)", min_value=0.0, max_value=15.0, value=defaults.get("frais_vente_pct", 6.0), step=0.5, help="Agence + notaire à la revente. Absent de l'ancienne formule — c'est le bug déjà noté sur le rapport Fichaux 6.")
@@ -546,6 +558,7 @@ if transaction == "vente":
         decote_arv_pct=decote_arv_pct, frais_notaire_pct=frais_notaire_pct,
         frais_acte_eur=frais_acte_eur, tva_travaux_pct=tva_travaux_pct,
         charges_portage_mensuelles=charges_portage_mensuelles,
+        prix_m2_plancher=prix_m2_plancher,
     )
 
     if mdb.empty:
