@@ -26,10 +26,14 @@ import pandas as pd
 import requests
 import streamlit as st
 
-from lib import get_credentials, annuite_facteur, get_with_retry
+from lib import get_credentials, annuite_facteur, get_with_retry, require_page_password
 
 st.set_page_config(page_title="Trajectoire patrimoniale — Repérage Immo",
                    page_icon="📈", layout="wide")
+
+# Page personnelle (situation patrimoniale de l'utilisateur) — protégée par mot de
+# passe pour permettre de partager le reste du dashboard sans exposer cette page.
+require_page_password("TRAJECTOIRE_PASSWORD", "la page Trajectoire patrimoniale")
 
 TAUX_VIEW = "v_dashboard_taux"
 RENDEMENT_VIEW = "v_dashboard_communes"

@@ -124,6 +124,55 @@ def get_with_retry(session_get, url, headers, params, timeout=60, tries=3):
     raise last_exc
 
 
+def require_page_password(secret_key, titre_page="cette page"):
+    """Bloque l'affichage de la page tant que le bon mot de passe n'est pas saisi.
+
+    Construit le 2026-09-16 pour partager le dashboard avec un tiers (frère de
+    l'utilisateur) sans lui donner accès à la page Trajectoire patrimoniale, qui
+    expose la situation financière personnelle de l'utilisateur (capital, objectif
+    de revenu, coût réel de son crédit).
+
+    Le mot de passe attendu vient de st.secrets (Streamlit Cloud) ou de moubri/.env
+    en local, même pattern que get_credentials() — jamais codé en dur ici. Si aucun
+    mot de passe n'est configuré, la page reste bloquée (fail-closed) plutôt que de
+    s'afficher sans protection : mieux vaut un oubli de configuration visible qu'une
+    fuite silencieuse.
+
+    Protection légère (mot de passe partagé, pas de compte par utilisateur) — adaptée
+    à un partage avec une poignée de proches, pas à un contrôle d'accès multi-utilisateurs.
+    """
+    import hmac
+
+    try:
+        attendu = st.secrets[secret_key] if secret_key in st.secrets else None
+    except Exception:
+        attendu = None
+    if not attendu:
+        attendu = load_env().get(secret_key)
+
+    state_key = f"_auth_ok_{secret_key}"
+    if st.session_state.get(state_key):
+        return
+
+    st.title("🔒 Accès restreint")
+    if not attendu:
+        st.error(
+            f"Aucun mot de passe configuré pour {titre_page} (secret `{secret_key}` manquant "
+            f"dans st.secrets ou moubri/.env) — accès bloqué tant qu'il n'est pas défini."
+        )
+        st.stop()
+
+    saisi = st.text_input(f"Mot de passe pour {titre_page}", type="password")
+    if not saisi:
+        st.stop()
+    if hmac.compare_digest(str(saisi), str(attendu)):
+        st.session_state[state_key] = True
+        st.rerun()
+    else:
+        st.error("Mot de passe incorrect.")
+        st.stop()
+
+
 def get_iso_proxy_credentials():
     """Proxy isochrones (Valhalla + géocodage) sur acolys-serveur.
     Streamlit Cloud: st.secrets. Local: fallback moubri/.env."""
