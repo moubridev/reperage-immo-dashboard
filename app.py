@@ -452,7 +452,15 @@ with st.sidebar.expander("Hypothèses de calcul", expanded=False):
     tva_travaux_pct = st.number_input("TVA travaux (%)", min_value=0.0, max_value=21.0, value=defaults.get("tva_travaux_pct", 6.0), step=15.0, help="6% pour un bâtiment de plus de 10 ans, 21% sinon. 15 points d'écart sur tout le budget travaux.")
     charges_portage_mensuelles = st.number_input("Charges de détention (€/mois)", min_value=0, max_value=3000, value=defaults.get("charges_portage_mensuelles", 180), step=20, help="Précompte immobilier, assurance, énergie, syndic. Absentes du calcul avant le 16/09.")
     frais_vente_pct = st.number_input("Frais de revente (%)", min_value=0.0, max_value=15.0, value=defaults.get("frais_vente_pct", 6.0), step=0.5, help="Agence + notaire à la revente. Absent de l'ancienne formule — c'est le bug déjà noté sur le rapport Fichaux 6.")
-    taux_financier_annuel_pct = st.number_input("Coût du capital annuel (%)", min_value=0.0, max_value=15.0, value=defaults.get("taux_financier_annuel_pct", 5.0), step=0.5, help="Taux de financement ou coût d'opportunité si cash.")
+    _taux_bce_defaut = 5.0
+    try:
+        _taux_ref = fetch_reference("v_dashboard_taux", "type_taux,valeur")
+        _bce_row = _taux_ref[_taux_ref["type_taux"] == "bce_facilite_depot"]
+        if not _bce_row.empty:
+            _taux_bce_defaut = float(_bce_row.iloc[0]["valeur"]) + 1.0
+    except Exception:
+        pass
+    taux_financier_annuel_pct = st.number_input("Coût du capital annuel (%)", min_value=0.0, max_value=15.0, value=defaults.get("taux_financier_annuel_pct", round(_taux_bce_defaut, 2)), step=0.5, help=f"Taux de financement ou coût d'opportunité si cash. Défaut suggéré : BCE (facilité de dépôt) + 1 point = {_taux_bce_defaut:.2f} % — variable, indexé sur les décisions futures de la BCE, pas figé à la signature.")
     duree_portage_mois = st.number_input("Durée de portage (mois)", min_value=1, max_value=60, value=defaults.get("duree_portage_mois", 9), step=1)
     appliquer_isoc = st.checkbox("Vente via société — appliquer l'ISOC sur la marge", value=defaults.get("appliquer_isoc", False))
     isoc_pct = st.number_input("Taux ISOC (%)", min_value=0.0, max_value=40.0, value=defaults.get("isoc_pct", 25.0), step=1.0, disabled=not appliquer_isoc)
@@ -460,6 +468,12 @@ with st.sidebar.expander("Hypothèses de calcul", expanded=False):
     seuil_go_fort = st.number_input("Seuil GO fort (marge % ≥)", min_value=0, max_value=200, value=defaults.get("seuil_go_fort", 30), step=5)
     seuil_go = st.number_input("Seuil GO (marge % ≥)", min_value=0, max_value=200, value=defaults.get("seuil_go", 15), step=5)
     seuil_limite = st.number_input("Seuil Limite (marge % ≥)", min_value=0, max_value=200, value=defaults.get("seuil_limite", 5), step=5)
+    st.markdown("**🎯 Objectif de portefeuille**")
+    st.caption("Un bien peut être « GO » sur la marge et hors de portée sur la vélocité — voir "
+               "*Trajectoire patrimoniale*. Ces deux seuils marquent les biens qui tiennent "
+               "réellement le rythme requis, pas seulement la marge.")
+    ticket_cible_eur = st.number_input("Ticket cible — capital engagé max (€)", min_value=50_000, max_value=1_000_000, value=defaults.get("ticket_cible_eur", 250_000), step=25_000, help="Gisement réel mesuré le 16/09 : sous 250 k€ de capital engagé, le ROI net annualisé médian grimpe à 28-32 % et permet 2,6 opérations en parallèle avec 500 k€ contre 1,4 sans ce plafond.")
+    roi_min_vise_pct = st.number_input("ROI net annualisé minimum visé (%)", min_value=0.0, max_value=100.0, value=defaults.get("roi_min_vise_pct", 15.0), step=1.0, help="Le seuil arithmétique pour tenir l'objectif de revenu tourne autour de 10-11 %/an (revue financière du 16/09, annualisation composée) — 15 % laisse une marge de sécurité sur ce même ROI, mais annualisé ici de façon linéaire (roi_pct × 12/durée), cohérent avec la colonne « ROI annualisé % » déjà affichée dans le tableau.")
 
 if st.sidebar.button("💾 Sauvegarder ces critères par défaut"):
     save_last_filters({
@@ -539,23 +553,41 @@ if transaction == "vente":
     else:
         mdb["statut"] = mdb["marge_pct"].apply(lambda m: statut_mdb(m, seuil_go_fort, seuil_go, seuil_limite))
         mdb = mdb.sort_values("marge_pct", ascending=False)
+        # Un bien "GO" sur la marge n'est pas forcément dans le gisement qui tient l'objectif
+        # de revenu : il faut AUSSI un ticket maîtrisé (vélocité) et un ROI net annualisé
+        # suffisant (voir pages/6_Trajectoire_Patrimoniale.py et REVUE_FINANCIER_2026-09-16).
+        mdb["dans_gisement_objectif"] = (
+            (mdb["capital_engage"] <= ticket_cible_eur) & (mdb["roi_annualise_pct"] >= roi_min_vise_pct)
+        )
 
-        m1, m2, m3, m4 = st.columns(4)
+        m1, m2, m3, m4, m5 = st.columns(5)
         m1.metric("🔴 GO fort", int((mdb["statut"] == "🔴 GO fort").sum()))
         m2.metric("🟡 GO", int((mdb["statut"] == "🟡 GO").sum()))
         m3.metric("⚪ Limite", int((mdb["statut"] == "⚪ Limite").sum()))
         go_df = mdb[mdb["statut"].isin(["🔴 GO fort", "🟡 GO"])]
         m4.metric("Marge médiane (GO)", f"{go_df['marge_pct'].median():.0f} %" if not go_df.empty else "—")
+        n_objectif = int(mdb["dans_gisement_objectif"].sum())
+        m5.metric("🎯 Dans l'objectif", n_objectif,
+                  help=f"Ticket ≤ {ticket_cible_eur:,.0f} € ET ROI net annualisé ≥ {roi_min_vise_pct:.0f} % — "
+                       f"le gisement qui tient réellement le rythme requis pour l'objectif de revenu, "
+                       f"pas seulement la marge. Voir *Trajectoire patrimoniale*.".replace(",", " "))
 
         low_n = int((mdb["n_comparables"] < 5).sum())
         if low_n:
             st.caption(f"⚠️ {low_n} biens notés avec un comparable de secours au niveau région (moins de 5 annonces PEB A-B trouvées dans leur commune) — marge moins fiable pour ceux-là, colonne « Comparable ».")
 
-        show = mdb[mdb["statut"] != "⬛ Écarté"].head(200)
-        show = show.copy()
+        filtrer_objectif = st.checkbox(
+            "🎯 N'afficher que le gisement dans l'objectif de revenu",
+            value=False, help="Filtre sur le seuil ticket/ROI défini dans la sidebar.")
+
+        show = mdb[mdb["statut"] != "⬛ Écarté"]
+        if filtrer_objectif:
+            show = show[show["dans_gisement_objectif"]]
+        show = show.head(200).copy()
         # Drapeaux que le praticien veut voir avant de se déplacer.
         show["signal"] = (
-            show.get("alerte_arv", False).fillna(False).map({True: "⚠️ ARV ", False: ""})
+            show.get("dans_gisement_objectif", False).fillna(False).map({True: "🎯 ", False: ""})
+            + show.get("alerte_arv", False).fillna(False).map({True: "⚠️ ARV ", False: ""})
             + show.get("dans_zone_houillere", False).fillna(False).map({True: "⛏️ Minier", False: ""})
         ).str.strip()
         top_table = show[
