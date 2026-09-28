@@ -81,23 +81,48 @@ RECLASSEMENT_SLUGS = {
     "building-land": "terrain",
     "apartment-block": "immeuble",
     "mansion": "maison",
+    # Trouve le 28/09 : un mixed-use-building (commerce + logements, prix et
+    # surface reels) est d«ord demote maison/appartement -> autre par
+    # NON_RESIDENTIEL_SLUGS (16/09, correctement -- ce n est pas une maison),
+    # mais n etait jamais RE-promu vers son vrai type. 470 annonces reelles
+    # concernees (prix et surface renseignes, hors projets neufs a prix null).
+    "mixed-use-building": "immeuble",
 }
 
 
 def type_bien_fiable(type_bien, url):
-    """Corrige le type de bien via le slug d'URL Immoweb, dans les deux sens :
-    dégrade un maison/appartement mal étiqueté vers "autre" (logique d'origine, 16/09),
-    et reclasse un "autre" mal étiqueté vers terrain/immeuble/maison quand le slug est
-    sans ambiguïté (28/09, voir RECLASSEMENT_SLUGS).
+    """Corrige le type de bien via le slug d'URL Immoweb.
 
-    Trouvé le 16/09 en analysant le signal "sous le marché" (demande utilisateur) :
-    385 annonces taguées maison/appartement pointent vers des URL "mixed-use-building",
-    "farm", etc. — un immeuble mixte commerce/habitation comparé à une médiane purement
-    résidentielle n'est pas une pépite, c'est un artefact de mauvais étiquetage. Ces
-    biens remontaient en tête du classement "sous le marché" précisément À CAUSE de
-    cette erreur (le commercial est structurellement moins cher au m² que l'habitable)."""
+    RECLASSEMENT_SLUGS est verifie EN PREMIER, quel que soit le type_bien de
+    depart : un slug sans ambiguite (mixed-use-building, apartment-block...)
+    prime sur le type grossier attribue par Immoweb. Trouve le 28/09 en testant
+    l ajout de "mixed-use-building" : l ancienne structure en deux branches
+    disjointes (maison/appartement -> autre, PUIS separement autre -> cible)
+    ne pouvait jamais enchainer les deux dans le meme appel -- une annonce
+    "maison" pointant vers /mixed-use-building/ restait bloquee sur "autre",
+    jamais promue vers "immeuble", meme apres l ajout de l entree.
+
+    Degrade ensuite un maison/appartement mal etiquete vers "autre" (logique
+    d origine, 16/09) si aucun reclassement plus precis n a matche avant.
+
+    Trouve le 16/09 en analysant le signal "sous le marche" (demande
+    utilisateur) : 385 annonces taguees maison/appartement pointent vers des
+    URL "mixed-use-building", "farm", etc. -- un immeuble mixte comparé a
+    une mediane purement residentielle n est pas une pepite, c est un artefact
+    de mauvais etiquetage."""
     if not isinstance(url, str):
         return type_bien
+
+    for slug, cible in RECLASSEMENT_SLUGS.items():
+        if f"/{slug}/" in url or f"classified/{slug}" in url:
+            return cible
+
+    if type_bien in ("maison", "appartement"):
+        for s in NON_RESIDENTIEL_SLUGS:
+            if f"/{s}" in url or f"classified/{s}" in url:
+                return "autre"
+
+    return type_bien
 
     if type_bien in ("maison", "appartement"):
         for s in NON_RESIDENTIEL_SLUGS:

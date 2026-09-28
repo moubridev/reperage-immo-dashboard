@@ -46,7 +46,7 @@ type_bien_fiable = NS["type_bien_fiable"]
     ("autre", "https://www.immoweb.be/fr/classified/commercial-premises/for-sale/x/6000/1", "autre"),
     # Dégradation maison/appartement mal étiqueté (comportement d\x27origine, 16/09)
     ("maison", "https://www.immoweb.be/fr/classified/house/for-sale/x/6000/1", "maison"),
-    ("maison", "https://www.immoweb.be/fr/classified/mixed-use-building/for-sale/x/6000/1", "autre"),
+    ("maison", "https://www.immoweb.be/fr/classified/mixed-use-building/for-sale/x/6000/1", "immeuble"),
     ("appartement", "https://www.immoweb.be/fr/classified/farm/for-sale/x/6000/1", "autre"),
     # Sources sans URL Immoweb : le type déjà attribué par le scraper reste tel quel
     ("terrain", "https://immo.notaire.be/fr/opportunite/x/1", "terrain"),
@@ -58,10 +58,11 @@ def test_type_bien_fiable(type_bien, url, attendu):
 
 
 def test_reclassement_couvre_les_trois_categories_mesurees():
-    """Non-régression sur la mesure du 28/09 : building-land, apartment-block et
-    mansion doivent rester dans la table, avec leur cible exacte."""
+    """Non-régression sur la mesure du 28/09 : building-land, apartment-block,
+    mansion et mixed-use-building doivent rester dans la table, avec leur cible exacte."""
     assert NS["RECLASSEMENT_SLUGS"] == {
         "building-land": "terrain",
         "apartment-block": "immeuble",
         "mansion": "maison",
+        "mixed-use-building": "immeuble",
     }
