@@ -33,7 +33,7 @@ FILTERS_PATH = DASHBOARD_DIR / "last_filters.json"
 SOURCE_VIEW = "v_dashboard_immo"
 SELECT_FIELDS = (
     "lat,lng,prix,surface_habitable,type_bien,type_transaction,commune,code_postal,"
-    "nb_chambres,annee_construction,peb,jours_sur_marche,url_principale"
+    "nb_chambres,annee_construction,peb,jours_sur_marche,url_principale,surface_terrain"
 )
 
 st.set_page_config(page_title="Repérage Immo", page_icon="🗺️", layout="wide")
@@ -165,6 +165,7 @@ def build_frame():
         return df, fetched_at
     df["prix"] = pd.to_numeric(df["prix"], errors="coerce")
     df["surface_habitable"] = pd.to_numeric(df["surface_habitable"], errors="coerce")
+    df["surface_terrain"] = pd.to_numeric(df.get("surface_terrain"), errors="coerce")
     df["lat"] = pd.to_numeric(df["lat"], errors="coerce")
     df["lng"] = pd.to_numeric(df["lng"], errors="coerce")
     df["nb_chambres"] = pd.to_numeric(df["nb_chambres"], errors="coerce")
@@ -211,6 +212,53 @@ def build_frame():
     df["commune_n_comparables"] = df["commune_norm"].map(commune_comp_n).fillna(0).astype(int)
     df["ecart_vs_marche_pct"] = (
         (df["prix_m2"] - df["commune_prix_m2_median"]) / df["commune_prix_m2_median"] * 100
+    )
+
+    # Comparateur terrain, ajoute le 28/09 (demande utilisateur : sourcing terrain).
+    # surface_habitable est presque toujours vide sur un terrain (293/2275 mesure
+    # le 28/09, contre 2269/2275 pour surface_terrain) -- c est donc surface_terrain
+    # qui sert de base au prix/m2.
+    #
+    # Verifie le 28/09 en calibrant ce comparateur (meme demarche que le plancher
+    # "400 EUR/m2" maison/appartement du 16/09) : une mediane par COMMUNE seule fait
+    # ressortir de fausses "bonnes affaires" -- Tubize et Saint-Ghislain semblaient
+    # 95%+ sous le marche, alors qu ils sont simplement de GRANDS terrains (3400-
+    # 10000 m2) dont le prix/m2 est mecaniquement plus bas qu une petite parcelle
+    # entierement constructible (effet de volume + part non constructible souvent
+    # incluse dans une grande parcelle). Comparer un terrain de 8000 m2 a la mediane
+    # de terrains de 500 m2 de la meme commune n a pas de sens -- corrige en calculant
+    # la mediane par (commune, tranche de surface) plutot que par commune seule.
+    #
+    # Enseignement du meme calibrage : le prix affiche par Biddit/notaire.be "opportunite"
+    # sur des terrains est une mise a prix, pas un prix de vente -- jusqu a 0,27 EUR/m2
+    # observe sur ces deux sources. Exclues du comparateur ET de la section "sous le
+    # marche" ci-dessous (meme logique que source_prix pour maison/appartement).
+    df["prix_m2_terrain"] = (df["prix"] / df["surface_terrain"]).where(df["surface_terrain"] > 0)
+
+    def _bande_surface_terrain(s):
+        if pd.isna(s):
+            return None
+        if s < 1000:
+            return "< 1000 m2"
+        if s < 3000:
+            return "1000-3000 m2"
+        return "> 3000 m2"
+
+    df["bande_surface_terrain"] = df["surface_terrain"].apply(_bande_surface_terrain)
+    comp_terrain = df[
+        (df["type_transaction"] == "vente") & df["type_bien"].eq("terrain")
+        & df["surface_terrain"].between(50, 10_000)
+        & (df["source_prix"] == "immoweb")
+    ]
+    comp_key = ["commune_norm", "bande_surface_terrain"]
+    terrain_comp_median = comp_terrain.groupby(comp_key)["prix_m2_terrain"].median()
+    terrain_comp_n = comp_terrain.groupby(comp_key)["prix_m2_terrain"].count()
+    idx = list(zip(df["commune_norm"], df["bande_surface_terrain"]))
+    df["commune_prix_m2_terrain_median"] = [terrain_comp_median.get(k) for k in idx]
+    df["commune_n_comparables_terrain"] = [int(terrain_comp_n.get(k, 0)) for k in idx]
+    df["ecart_terrain_vs_marche_pct"] = (
+        (df["prix_m2_terrain"] - df["commune_prix_m2_terrain_median"])
+        / df["commune_prix_m2_terrain_median"] * 100
     )
     return df, fetched_at
 
@@ -764,6 +812,72 @@ else:
         sm_table, use_container_width=True, height=380, hide_index=True,
         column_config={
             "vs marché (%)": st.column_config.NumberColumn(format="%.0f %%"),
+            "Annonce": st.column_config.LinkColumn(display_text="Voir ↗"),
+        },
+    )
+
+# ------------------------------------------------------------- terrains à bâtir
+# Ajouté le 28/09 (demande utilisateur : sourcing terrain). Même principe que la
+# section maison/appartement ci-dessus, appliqué à `surface_terrain` — voir le
+# comparateur construit dans build_frame(). Le type "terrain" était quasi invisible
+# avant le correctif du 28/09 sur type_bien_fiable() : la plupart des vrais terrains
+# à bâtir étaient tagués "autre" (slug Immoweb "building-land").
+st.markdown("##### 🏗️ Terrains à bâtir sous le marché")
+st.caption(
+    "Écart du prix/m² de TERRAIN par rapport à la médiane des ventes de terrains de la "
+    "commune. Aucun plancher de plausibilité type « 400 €/m² » ici (contrairement au bloc "
+    "maison/appartement) : le prix au m² d’un terrain varie légitimement d’un facteur 10 selon "
+    "la zone (agricole vs constructible, viabilisé ou non) — aucune coupure nette n’a été "
+    "mesurée entre marge de négociation et erreur de saisie. À vérifier vous-même sur le plan "
+    "de secteur avant toute offre : ce chiffre ne dit rien de la constructibilité réelle."
+)
+ecart_terrain_seuil = st.slider("Écart minimum sous le marché terrain (%)", -60, 0, -15, 5, key="ecart_terrain")
+comp_min_terrain = st.number_input(
+    "Nombre minimum de ventes de terrains comparables dans la commune", 0, 50, 5, 1,
+    key="comp_min_terrain",
+    help="Même garde-fou que pour maison/appartement : en dessous, la médiane communale "
+         "repose sur trop peu de ventes pour être fiable.",
+)
+terrain_surface_ok = f["surface_terrain"].between(50, 10_000)
+terrain_base = f[
+    f["type_bien"].eq("terrain")
+    & terrain_surface_ok
+    & f["ecart_terrain_vs_marche_pct"].notna()
+    & (f["commune_n_comparables_terrain"] >= comp_min_terrain)
+    & (f["source_prix"] == "immoweb")
+].copy()
+terrain_base["dup_key"] = (
+    terrain_base["commune_norm"] + "_" + terrain_base["prix"].astype(str)
+    + "_" + terrain_base["surface_terrain"].astype(str)
+)
+n_avant_dedup_terrain = len(terrain_base)
+terrain_base = terrain_base.drop_duplicates("dup_key")
+n_doublons_terrain = n_avant_dedup_terrain - len(terrain_base)
+terrain_sous_marche = terrain_base[
+    terrain_base["ecart_terrain_vs_marche_pct"] <= ecart_terrain_seuil
+].sort_values("ecart_terrain_vs_marche_pct")
+
+st.metric("Terrains sous le marché", f"{len(terrain_sous_marche):,}".replace(",", " "))
+if n_doublons_terrain:
+    st.caption(f"({n_doublons_terrain} doublons cross-source retirés)")
+if terrain_sous_marche.empty:
+    st.info("Aucun terrain sous ce seuil avec les filtres actuels.")
+else:
+    terrain_table = terrain_sous_marche.head(100)[
+        ["commune", "code_postal", "prix", "surface_terrain", "prix_m2_terrain",
+         "jours_sur_marche", "ecart_terrain_vs_marche_pct", "commune_n_comparables_terrain",
+         "url_principale"]
+    ].rename(columns={
+        "commune": "Commune", "code_postal": "CP", "prix": "Prix (€)",
+        "surface_terrain": "Surface terrain (m²)", "prix_m2_terrain": "Prix/m² terrain (€)",
+        "jours_sur_marche": "Jours en ligne", "ecart_terrain_vs_marche_pct": "vs marché (%)",
+        "commune_n_comparables_terrain": "N ventes comparables", "url_principale": "Annonce",
+    })
+    st.dataframe(
+        terrain_table, use_container_width=True, height=380, hide_index=True,
+        column_config={
+            "vs marché (%)": st.column_config.NumberColumn(format="%.0f %%"),
+            "Prix/m² terrain (€)": st.column_config.NumberColumn(format="%.0f €"),
             "Annonce": st.column_config.LinkColumn(display_text="Voir ↗"),
         },
     )
