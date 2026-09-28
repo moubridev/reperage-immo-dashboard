@@ -34,7 +34,7 @@ SOURCE_VIEW = "v_dashboard_immo"
 SELECT_FIELDS = (
     "lat,lng,prix,surface_habitable,type_bien,type_transaction,commune,code_postal,"
     "nb_chambres,annee_construction,peb,jours_sur_marche,url_principale,surface_terrain,"
-    "nb_unites_estime,nb_unites_source,is_mixte_usage,caracteristiques_extraites"
+    "nb_unites_estime,nb_unites_source,is_mixte_usage,caracteristiques_extraites,is_investment_property"
 )
 
 st.set_page_config(page_title="Repérage Immo", page_icon="🗺️", layout="wide")
@@ -82,7 +82,7 @@ RECLASSEMENT_SLUGS = {
     "apartment-block": "immeuble",
     "mansion": "maison",
     # Trouve le 28/09 : un mixed-use-building (commerce + logements, prix et
-    # surface reels) est d«ord demote maison/appartement -> autre par
+    # surface reels) est d'abord demote maison/appartement -> autre par
     # NON_RESIDENTIEL_SLUGS (16/09, correctement -- ce n est pas une maison),
     # mais n etait jamais RE-promu vers son vrai type. 470 annonces reelles
     # concernees (prix et surface renseignes, hors projets neufs a prix null).
@@ -201,6 +201,25 @@ def build_frame():
     df["region"] = df["code_postal"].apply(region_of)
     df["type_bien"] = df["type_bien"].fillna("autre")
     df["type_bien"] = [type_bien_fiable(t, u) for t, u in zip(df["type_bien"], df["url_principale"])]
+
+    # Reclassement complementaire, trouve le 28/09 en repondant a la question
+    # "comment capter les immeubles mal categorises par les agents" : deux
+    # signaux STRUCTURES (deja scrapes, zero cout reseau/LLM) identifient sans
+    # ambiguite un immeuble tague maison/appartement par erreur de saisie --
+    # l'agence a coche "bien d'investissement" (is_investment_property=true,
+    # 73 annonces mesurees) ou renseigne plusieurs unites locatives
+    # (nb_unites_estime>1, 80 annonces) tout en choisissant le mauvais type
+    # Immoweb. Contrairement a RECLASSEMENT_SLUGS (base sur l'URL), ce
+    # signal vient de colonnes structurees, d'ou un passage separe plutot
+    # qu'un ajout a type_bien_fiable (qui ne prend que type_bien + url).
+    _signal_investisseur = (
+        df["type_bien"].isin(["maison", "appartement"])
+        & (
+            df.get("is_investment_property", False).fillna(False)
+            | (pd.to_numeric(df.get("nb_unites_estime"), errors="coerce").fillna(0) > 1)
+        )
+    )
+    df.loc[_signal_investisseur, "type_bien"] = "immeuble"
     df["commune"] = df["commune"].fillna("?")
     df["peb"] = df["peb"].fillna("n.c.")
     # `code_ins` est NULL sur ~98% de la base (Dev Log 2026-08-31) : le seul
