@@ -138,6 +138,33 @@ def type_bien_fiable(type_bien, url):
     return type_bien
 
 
+def type_bien_via_signal_investisseur(type_bien, is_investment_property, nb_unites_estime):
+    """Reclasse un maison/appartement en immeuble quand un champ STRUCTURE
+    (deja scrape, zero cout reseau/LLM) le trahit sans ambiguite.
+
+    Trouve le 28/09 en repondant a "comment capter les immeubles mal
+    categorises par les agents, sans exploser le temps de scrap ni la
+    consommation de token" : deux signaux suffisent, tous deux deja en base --
+    l'agence a coche "bien d'investissement" sur Immoweb (is_investment_property)
+    ou renseigne plusieurs unites locatives (nb_unites_estime>1) tout en
+    choisissant le mauvais type. Mesure le 28/09 : 73 + 80 annonces concernees.
+
+    Fonction separee de type_bien_fiable (qui ne prend que type_bien + url) :
+    ce signal vient de colonnes structurees, pas d'un slug d'URL -- les
+    regrouper aurait rendu les deux logiques moins lisibles et moins
+    testables independamment."""
+    if type_bien not in ("maison", "appartement"):
+        return type_bien
+    if is_investment_property:
+        return "immeuble"
+    try:
+        if nb_unites_estime is not None and float(nb_unites_estime) > 1:
+            return "immeuble"
+    except (TypeError, ValueError):
+        pass
+    return type_bien
+
+
 def classify_source_prix(u):
     """Distingue les sources où le prix affiché n'est PAS un prix ferme.
 
@@ -202,24 +229,10 @@ def build_frame():
     df["type_bien"] = df["type_bien"].fillna("autre")
     df["type_bien"] = [type_bien_fiable(t, u) for t, u in zip(df["type_bien"], df["url_principale"])]
 
-    # Reclassement complementaire, trouve le 28/09 en repondant a la question
-    # "comment capter les immeubles mal categorises par les agents" : deux
-    # signaux STRUCTURES (deja scrapes, zero cout reseau/LLM) identifient sans
-    # ambiguite un immeuble tague maison/appartement par erreur de saisie --
-    # l'agence a coche "bien d'investissement" (is_investment_property=true,
-    # 73 annonces mesurees) ou renseigne plusieurs unites locatives
-    # (nb_unites_estime>1, 80 annonces) tout en choisissant le mauvais type
-    # Immoweb. Contrairement a RECLASSEMENT_SLUGS (base sur l'URL), ce
-    # signal vient de colonnes structurees, d'ou un passage separe plutot
-    # qu'un ajout a type_bien_fiable (qui ne prend que type_bien + url).
-    _signal_investisseur = (
-        df["type_bien"].isin(["maison", "appartement"])
-        & (
-            df.get("is_investment_property", False).fillna(False)
-            | (pd.to_numeric(df.get("nb_unites_estime"), errors="coerce").fillna(0) > 1)
-        )
-    )
-    df.loc[_signal_investisseur, "type_bien"] = "immeuble"
+    df["type_bien"] = [
+        type_bien_via_signal_investisseur(t, ip, nu)
+        for t, ip, nu in zip(df["type_bien"], df.get("is_investment_property"), df.get("nb_unites_estime"))
+    ]
     df["commune"] = df["commune"].fillna("?")
     df["peb"] = df["peb"].fillna("n.c.")
     # `code_ins` est NULL sur ~98% de la base (Dev Log 2026-08-31) : le seul
