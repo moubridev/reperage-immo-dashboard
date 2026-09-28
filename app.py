@@ -33,7 +33,8 @@ FILTERS_PATH = DASHBOARD_DIR / "last_filters.json"
 SOURCE_VIEW = "v_dashboard_immo"
 SELECT_FIELDS = (
     "lat,lng,prix,surface_habitable,type_bien,type_transaction,commune,code_postal,"
-    "nb_chambres,annee_construction,peb,jours_sur_marche,url_principale,surface_terrain"
+    "nb_chambres,annee_construction,peb,jours_sur_marche,url_principale,surface_terrain,"
+    "nb_unites_estime,nb_unites_source,is_mixte_usage,caracteristiques_extraites"
 )
 
 st.set_page_config(page_title="Repérage Immo", page_icon="🗺️", layout="wide")
@@ -878,6 +879,65 @@ else:
         column_config={
             "vs marché (%)": st.column_config.NumberColumn(format="%.0f %%"),
             "Prix/m² terrain (€)": st.column_config.NumberColumn(format="%.0f €"),
+            "Annonce": st.column_config.LinkColumn(display_text="Voir ↗"),
+        },
+    )
+
+# ------------------------------------------------------ immeubles de rapport
+# Ajoute le 28/09 (demande utilisateur). Sourcing seul -- prix, surface,
+# commune, carte -- fonctionne des le correctif de type_bien (397 immeubles
+# reellement en vente aujourd hui, contre 0 filtrables avant). Le nombre
+# d unites, la separation des compteurs et le commerce au rez n existent PAS
+# dans les champs structures scrapes pour l ecrasante majorite des annonces
+# (verifie le 28/09) -- aucun calcul de rendement locatif n est construit ici,
+# ce serait fabriquer une precision que la donnee ne permet pas.
+#
+# Quand le texte libre de l annonce (description_brute) est suffisamment
+# explicite, une extraction ponctuelle (LLM, perimetre volontairement etroit :
+# uniquement type_bien=immeuble, jamais toute la base) remonte nb_unites_estime
+# et is_mixte_usage -- toujours marques "a verifier", jamais une certitude.
+# Script : src/extraction_immeuble_llm.py.
+st.markdown("##### 🏢 Immeubles de rapport")
+immeubles = f[f["type_bien"].eq("immeuble")].copy()
+st.caption(
+    f"{len(immeubles):,} immeuble(s) en vente correspondant aux filtres. "
+    "Nombre d unites, compteurs et commerce au rez ne sont PAS dans les donnees "
+    "structurees pour la plupart des annonces -- a verifier a la visite ou "
+    "aupres de l agence avant toute offre. Quand une extraction du texte de "
+    "l annonce existe, elle est signalee ci-dessous avec son niveau de confiance "
+    "(jamais une donnee sure)."
+    .replace(",", " ")
+)
+if immeubles.empty:
+    st.info("Aucun immeuble de rapport avec les filtres actuels.")
+else:
+    def _confiance_extraction(c):
+        if isinstance(c, dict):
+            return c.get("confiance_extraction")
+        return None
+
+    immeubles["confiance_extraction"] = immeubles.get(
+        "caracteristiques_extraites", pd.Series([None] * len(immeubles), index=immeubles.index)
+    ).apply(_confiance_extraction)
+    immeubles["nb_unites_affiche"] = immeubles.apply(
+        lambda r: (f"{int(r[nb_unites_estime])} (texte, confiance {int(r[confiance_extraction])}%)"
+                   if pd.notna(r.get("nb_unites_estime")) and r.get("nb_unites_source", "").startswith("llm_description")
+                   else (str(int(r["nb_unites_estime"])) if pd.notna(r.get("nb_unites_estime")) else "?")),
+        axis=1,
+    )
+    imm_table = immeubles.sort_values("prix_m2").head(100)[
+        ["commune", "code_postal", "prix", "surface_habitable", "prix_m2",
+         "nb_unites_affiche", "is_mixte_usage", "jours_sur_marche", "url_principale"]
+    ].rename(columns={
+        "commune": "Commune", "code_postal": "CP", "prix": "Prix (€)",
+        "surface_habitable": "Surface (m²)", "prix_m2": "Prix/m² (€)",
+        "nb_unites_affiche": "Unites (si connu)", "is_mixte_usage": "Commerce au rez (si connu)",
+        "jours_sur_marche": "Jours en ligne", "url_principale": "Annonce",
+    })
+    st.dataframe(
+        imm_table, use_container_width=True, height=380, hide_index=True,
+        column_config={
+            "Prix/m² (€)": st.column_config.NumberColumn(format="%.0f €"),
             "Annonce": st.column_config.LinkColumn(display_text="Voir ↗"),
         },
     )
