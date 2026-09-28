@@ -64,8 +64,30 @@ NON_RESIDENTIEL_SLUGS = ("mixed-use", "commercial", "industrial", "office", "war
                          "parking", "land", "plot", "farm", "factory")
 
 
+# Reclassement additionnel trouvé le 28/09 (demande utilisateur : sourcing terrain +
+# immeuble de rapport) : `type_bien` vient du champ Immoweb "category", qui range sous
+# un fourre-tout "autre" des biens en réalité identifiables sans ambiguïté via le slug
+# d'URL. Mesuré sur la base réelle avant correctif :
+#   - building-land   : 4 196 annonces (dont 3 633 actives) — des TERRAINS À BÂTIR,
+#     invisibles de tout filtre "terrain" alors que c'est la plus grosse poche du genre.
+#   - apartment-block : 1 076 (1 022 actives) — des IMMEUBLES DE RAPPORT.
+#   - mansion         : 165 (156 actives) — des maisons haut de gamme, rattachées à
+#     "maison" pour l'analyse (le prix/m² reste comparable, contrairement à un terrain
+#     ou un immeuble à appartements multiples).
+# Sans ce correctif, un tiers du volume de vente ("autre", 10 761 annonces) restait
+# hors de portée de tout scoring, y compris pour des biens parfaitement classables.
+RECLASSEMENT_SLUGS = {
+    "building-land": "terrain",
+    "apartment-block": "immeuble",
+    "mansion": "maison",
+}
+
+
 def type_bien_fiable(type_bien, url):
-    """Corrige le type de bien via le slug d'URL Immoweb quand il contredit `type_bien`.
+    """Corrige le type de bien via le slug d'URL Immoweb, dans les deux sens :
+    dégrade un maison/appartement mal étiqueté vers "autre" (logique d'origine, 16/09),
+    et reclasse un "autre" mal étiqueté vers terrain/immeuble/maison quand le slug est
+    sans ambiguïté (28/09, voir RECLASSEMENT_SLUGS).
 
     Trouvé le 16/09 en analysant le signal "sous le marché" (demande utilisateur) :
     385 annonces taguées maison/appartement pointent vers des URL "mixed-use-building",
@@ -73,11 +95,20 @@ def type_bien_fiable(type_bien, url):
     résidentielle n'est pas une pépite, c'est un artefact de mauvais étiquetage. Ces
     biens remontaient en tête du classement "sous le marché" précisément À CAUSE de
     cette erreur (le commercial est structurellement moins cher au m² que l'habitable)."""
-    if type_bien not in ("maison", "appartement") or not isinstance(url, str):
+    if not isinstance(url, str):
         return type_bien
-    for s in NON_RESIDENTIEL_SLUGS:
-        if f"/{s}" in url or f"classified/{s}" in url:
-            return "autre"
+
+    if type_bien in ("maison", "appartement"):
+        for s in NON_RESIDENTIEL_SLUGS:
+            if f"/{s}" in url or f"classified/{s}" in url:
+                return "autre"
+        return type_bien
+
+    if type_bien == "autre":
+        for slug, cible in RECLASSEMENT_SLUGS.items():
+            if f"/{slug}/" in url or f"classified/{slug}" in url:
+                return cible
+
     return type_bien
 
 
