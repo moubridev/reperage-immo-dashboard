@@ -34,7 +34,8 @@ SOURCE_VIEW = "v_dashboard_immo"
 SELECT_FIELDS = (
     "lat,lng,prix,surface_habitable,type_bien,type_transaction,commune,code_postal,"
     "nb_chambres,annee_construction,peb,jours_sur_marche,url_principale,surface_terrain,"
-    "nb_unites_estime,nb_unites_source,is_mixte_usage,caracteristiques_extraites,is_investment_property"
+    "nb_unites_estime,nb_unites_source,is_mixte_usage,caracteristiques_extraites,is_investment_property,"
+    "sous_type_vente,nb_baisses_prix"
 )
 
 st.set_page_config(page_title="Repérage Immo", page_icon="🗺️", layout="wide")
@@ -184,6 +185,19 @@ def classify_source_prix(u):
     return "immoweb"
 
 
+SOURCES_ENCHERE = ("enchere_biddit", "enchere_notaire", "enchere_immoweb")
+
+
+def source_prix_effective(url, sous_type_vente):
+    """Une vente publique annoncée sur Immoweb affiche aussi une mise à prix :
+    elle rejoint les enchères au lieu de polluer le classement principal.
+    `sous_type_vente` est écrit par verifier_statuts_immoweb.py (depuis le 29/09)."""
+    source = classify_source_prix(url)
+    if source == "immoweb" and sous_type_vente == "vente_publique":
+        return "enchere_immoweb"
+    return source
+
+
 @st.cache_data(ttl=3600, show_spinner=False)
 def fetch_annonces():
     url, key = get_credentials()
@@ -240,7 +254,9 @@ def build_frame():
     # contient des variantes de casse ("Mons" / "MONS"). On normalise au moins
     # ça pour ne pas fragmenter artificiellement les comparables.
     df["commune_norm"] = df["commune"].str.strip().str.upper()
-    df["source_prix"] = df["url_principale"].apply(classify_source_prix)
+    sous_types = df["sous_type_vente"] if "sous_type_vente" in df.columns else [None] * len(df)
+    df["source_prix"] = [source_prix_effective(u, s) for u, s in zip(df["url_principale"], sous_types)]
+    df["nb_baisses_prix"] = pd.to_numeric(df.get("nb_baisses_prix"), errors="coerce").fillna(0).astype(int)
 
     # Comparable marché "prix/m²" par commune (pour le ratio "vs marché local") —
     # calculé sur tout le jeu de données, pas sur la sélection filtrée, pour rester
@@ -435,7 +451,7 @@ def compute_mdb_scores(
     # (aucune statistique belge fiable trouvée le 16/09 sur l'écart mise à prix -> prix
     # adjugé) — paramètre volontairement laissé à calibrer par l'utilisateur plutôt que
     # par un chiffre inventé.
-    d["est_enchere"] = d["source_prix"].isin(["enchere_biddit", "enchere_notaire"])
+    d["est_enchere"] = d["source_prix"].isin(SOURCES_ENCHERE)
     d["prix_acquisition"] = d["prix"] * d["est_enchere"].map(
         {True: 1 + majoration_encheres_pct / 100, False: 1.0})
 
@@ -859,10 +875,11 @@ if sous_marche.empty:
 else:
     sm_table = sous_marche.head(100)[
         ["commune", "code_postal", "type_bien", "prix", "surface_habitable", "peb",
-         "jours_sur_marche", "ecart_vs_marche_pct", "commune_n_comparables", "url_principale"]
+         "jours_sur_marche", "nb_baisses_prix", "ecart_vs_marche_pct", "commune_n_comparables", "url_principale"]
     ].rename(columns={
         "commune": "Commune", "code_postal": "CP", "type_bien": "Type", "prix": "Prix (€)",
         "surface_habitable": "Surface (m²)", "peb": "PEB", "jours_sur_marche": "Jours en ligne",
+        "nb_baisses_prix": "Baisses de prix",
         "ecart_vs_marche_pct": "vs marché (%)", "commune_n_comparables": "N ventes comparables",
         "url_principale": "Annonce",
     })
@@ -977,8 +994,8 @@ else:
         "caracteristiques_extraites", pd.Series([None] * len(immeubles), index=immeubles.index)
     ).apply(_confiance_extraction)
     immeubles["nb_unites_affiche"] = immeubles.apply(
-        lambda r: (f"{int(r[nb_unites_estime])} (texte, confiance {int(r[confiance_extraction])}%)"
-                   if pd.notna(r.get("nb_unites_estime")) and r.get("nb_unites_source", "").startswith("llm_description")
+        lambda r: (f"{int(r['nb_unites_estime'])} (texte, confiance {int(r['confiance_extraction']) if pd.notna(r['confiance_extraction']) else '?'}%)"
+                   if pd.notna(r.get("nb_unites_estime")) and str(r.get("nb_unites_source") or "").startswith("llm_description")
                    else (str(int(r["nb_unites_estime"])) if pd.notna(r.get("nb_unites_estime")) else "?")),
         axis=1,
     )
@@ -1041,7 +1058,8 @@ else:
         "commune_n_comparables": "N ventes comparables", "url_principale": "Annonce",
     })
     enc_table["Plateforme"] = enc_table["Plateforme"].map(
-        {"enchere_biddit": "Biddit", "enchere_notaire": "notaire.be"})
+        {"enchere_biddit": "Biddit", "enchere_notaire": "notaire.be",
+         "enchere_immoweb": "Immoweb (vente publique)"})
     st.dataframe(
         enc_table, use_container_width=True, height=320, hide_index=True,
         column_config={
@@ -1049,6 +1067,48 @@ else:
             "Annonce": st.column_config.LinkColumn(display_text="Voir ↗"),
         },
     )
+
+st.markdown("---")
+
+# ------------------------------------------------------------ vitesse de vente
+# Ajouté le 29/09 (question utilisateur : « la vitesse de vente est-elle bien captée ? »).
+# Elle ne l'était pas : les statuts n'étaient revérifiés que sur les 500 annonces les
+# plus récentes et les passages sous option n'étaient jamais captés. Alimenté depuis
+# par verifier_statuts_immoweb.py (acolys-serveur, tous les jours à 9h30).
+if transaction == "vente":
+    st.subheader("⏱️ Vitesse de vente par commune")
+    st.caption(
+        "Délai entre la publication d'une annonce et son passage sous option (compromis) — "
+        "ou, à défaut, sa disparition d'Immoweb. Seuls les événements constatés à 14 jours "
+        "près sont comptés. Une disparition peut aussi être un retrait sans vente : plus la "
+        "colonne « % passés par une option » est haute, plus le délai reflète de vraies ventes. "
+        "Mesure démarrée le 29/09 : les communes apparaissent au fil des semaines."
+    )
+    try:
+        delais = fetch_reference(
+            "v_dashboard_delai_vente",
+            "commune_norm,type_bien,n_ventes,delai_median_jours,delai_p25_jours,"
+            "delai_p75_jours,pct_passes_par_option",
+        )
+    except requests.RequestException:
+        delais = pd.DataFrame()
+        st.warning("Délais de vente momentanément indisponibles.")
+    n_min_delai = st.number_input("Nombre minimum de ventes mesurées par commune", 1, 50, 5, 1,
+                                  key="n_min_delai")
+    if not delais.empty:
+        delais = delais[pd.to_numeric(delais["n_ventes"], errors="coerce") >= n_min_delai]
+    if delais.empty:
+        st.info("Pas encore assez de ventes mesurées avec ce seuil — la mesure a démarré le 29/09, "
+                "premiers chiffres fiables attendus d'ici 2 à 3 semaines.")
+    else:
+        st.dataframe(
+            delais.sort_values("delai_median_jours").rename(columns={
+                "commune_norm": "Commune", "type_bien": "Type", "n_ventes": "Ventes mesurées",
+                "delai_median_jours": "Délai médian (j)", "delai_p25_jours": "25 % vendus en (j)",
+                "delai_p75_jours": "75 % vendus en (j)", "pct_passes_par_option": "% passés par une option",
+            }),
+            use_container_width=True, height=320, hide_index=True,
+        )
 
 st.markdown("---")
 
