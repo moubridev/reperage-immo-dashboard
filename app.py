@@ -187,6 +187,28 @@ def classify_source_prix(u):
 
 SOURCES_ENCHERE = ("enchere_biddit", "enchere_notaire", "enchere_immoweb")
 
+# Tranches de surface habitable pour le comparateur « sous le marché » (30/09) :
+# le prix/m² baisse mécaniquement avec la taille. Comparées à la médiane de TOUTES
+# les maisons de la commune, les grandes maisons remplissaient le haut du classement
+# (maison de 320 m² à Ath à 609 €/m² affichée -73 %) sans être des affaires.
+BANDES_SURFACE_HABITABLE = {
+    "maison": [(0, 120, "< 120 m²"), (120, 180, "120-180 m²"), (180, 250, "180-250 m²"), (250, 10_000, "> 250 m²")],
+    "appartement": [(0, 60, "< 60 m²"), (60, 90, "60-90 m²"), (90, 130, "90-130 m²"), (130, 10_000, "> 130 m²")],
+}
+
+
+def bande_surface_habitable(type_bien, surface):
+    try:
+        s = float(surface)
+    except (TypeError, ValueError):
+        return None
+    if s != s:  # NaN
+        return None
+    for bas, haut, label in BANDES_SURFACE_HABITABLE.get(type_bien, []):
+        if bas <= s < haut:
+            return label
+    return None
+
 
 def source_prix_effective(url, sous_type_vente):
     """Une vente publique annoncée sur Immoweb affiche aussi une mise à prix :
@@ -280,10 +302,19 @@ def build_frame():
         & df["surface_habitable"].between(15, 600)
         & (df["prix_m2"] >= 400)
     ]
-    commune_comp_all = comp_marche.groupby("commune_norm")["prix_m2"].median()
-    commune_comp_n = comp_marche.groupby("commune_norm")["prix_m2"].count()
-    df["commune_prix_m2_median"] = df["commune_norm"].map(commune_comp_all)
-    df["commune_n_comparables"] = df["commune_norm"].map(commune_comp_n).fillna(0).astype(int)
+    # Comparaison à même type ET même tranche de surface (30/09) : la médiane mélangeait
+    # maisons et appartements de la commune, toutes tailles confondues.
+    df["bande_surface_habitable"] = [
+        bande_surface_habitable(t, s) for t, s in zip(df["type_bien"], df["surface_habitable"])
+    ]
+    comp_marche = comp_marche.assign(bande_surface_habitable=df.loc[comp_marche.index, "bande_surface_habitable"])
+    cle_comp = ["commune_norm", "type_bien", "bande_surface_habitable"]
+    commune_comp_all = comp_marche.groupby(cle_comp)["prix_m2"].median()
+    commune_comp_n = comp_marche.groupby(cle_comp)["prix_m2"].count()
+    cles = list(zip(df["commune_norm"], df["type_bien"], df["bande_surface_habitable"]))
+    df["commune_prix_m2_median"] = [commune_comp_all.get(k) for k in cles]
+    df["commune_n_comparables"] = [int(commune_comp_n.get(k, 0)) for k in cles]
+    df["commune_prix_m2_median"] = pd.to_numeric(df["commune_prix_m2_median"], errors="coerce")
     df["ecart_vs_marche_pct"] = (
         (df["prix_m2"] - df["commune_prix_m2_median"]) / df["commune_prix_m2_median"] * 100
     )
@@ -821,7 +852,9 @@ if nouveaute_jours != "Pas de limite":
 
 st.subheader("💎 Biens sous le marché local")
 st.caption(
-    "Écart du prix/m² par rapport à la médiane des VENTES maison/appartement de la commune — "
+    "Écart du prix/m² par rapport à la médiane des ventes du MÊME TYPE et de la MÊME TRANCHE DE "
+    "SURFACE dans la commune (ex. maisons de 180-250 m² à Ath) — une grande maison n'est plus "
+    "comparée aux petites, dont le m² est mécaniquement plus cher. "
     "aucune hypothèse de rénovation ni de financement, juste le prix affiché comparé au marché "
     "local. Moins riche que l'analyse MdB ci-dessous, mais moins d'hypothèses à faire confiance : "
     "c'est le point de départ, pas le calcul final."
