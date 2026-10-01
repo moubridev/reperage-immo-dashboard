@@ -35,7 +35,7 @@ SELECT_FIELDS = (
     "lat,lng,prix,surface_habitable,type_bien,type_transaction,commune,code_postal,"
     "nb_chambres,annee_construction,peb,jours_sur_marche,url_principale,surface_terrain,"
     "nb_unites_estime,nb_unites_source,is_mixte_usage,caracteristiques_extraites,is_investment_property,"
-    "sous_type_vente,nb_baisses_prix"
+    "sous_type_vente,nb_baisses_prix,est_neuf"
 )
 
 st.set_page_config(page_title="Repérage Immo", page_icon="🗺️", layout="wide")
@@ -307,11 +307,17 @@ def build_frame():
     df["bande_surface_habitable"] = [
         bande_surface_habitable(t, s) for t, s in zip(df["type_bien"], df["surface_habitable"])
     ]
-    comp_marche = comp_marche.assign(bande_surface_habitable=df.loc[comp_marche.index, "bande_surface_habitable"])
-    cle_comp = ["commune_norm", "type_bien", "bande_surface_habitable"]
+    # Neuf comparé au neuf (01/10) : à Andenne, des appartements anciens à rénover
+    # paraissaient -69 % parce que la médiane était tirée par de gros projets neufs.
+    df["est_neuf"] = df["est_neuf"].fillna(False).astype(bool) if "est_neuf" in df.columns else False
+    comp_marche = comp_marche.assign(
+        bande_surface_habitable=df.loc[comp_marche.index, "bande_surface_habitable"],
+        est_neuf=df.loc[comp_marche.index, "est_neuf"],
+    )
+    cle_comp = ["commune_norm", "type_bien", "bande_surface_habitable", "est_neuf"]
     commune_comp_all = comp_marche.groupby(cle_comp)["prix_m2"].median()
     commune_comp_n = comp_marche.groupby(cle_comp)["prix_m2"].count()
-    cles = list(zip(df["commune_norm"], df["type_bien"], df["bande_surface_habitable"]))
+    cles = list(zip(df["commune_norm"], df["type_bien"], df["bande_surface_habitable"], df["est_neuf"]))
     df["commune_prix_m2_median"] = [commune_comp_all.get(k) for k in cles]
     df["commune_n_comparables"] = [int(commune_comp_n.get(k, 0)) for k in cles]
     df["commune_prix_m2_median"] = pd.to_numeric(df["commune_prix_m2_median"], errors="coerce")
@@ -852,9 +858,9 @@ if nouveaute_jours != "Pas de limite":
 
 st.subheader("💎 Biens sous le marché local")
 st.caption(
-    "Écart du prix/m² par rapport à la médiane des ventes du MÊME TYPE et de la MÊME TRANCHE DE "
-    "SURFACE dans la commune (ex. maisons de 180-250 m² à Ath) — une grande maison n'est plus "
-    "comparée aux petites, dont le m² est mécaniquement plus cher. "
+    "Écart du prix/m² par rapport à la médiane des ventes du MÊME TYPE, de la MÊME TRANCHE DE "
+    "SURFACE et du même âge (neuf / ancien) dans la commune (ex. maisons anciennes de 180-250 m² "
+    "à Ath) — une grande maison n'est plus comparée aux petites, ni un bien à rénover au neuf. "
     "aucune hypothèse de rénovation ni de financement, juste le prix affiché comparé au marché "
     "local. Moins riche que l'analyse MdB ci-dessous, mais moins d'hypothèses à faire confiance : "
     "c'est le point de départ, pas le calcul final."
