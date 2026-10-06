@@ -24,6 +24,8 @@ import folium
 from folium.plugins import MarkerCluster
 
 from lib import get_credentials
+from moteur_sourcing import Hypotheses, ReferencesRevente, flip as moteur_flip
+import dataclasses
 
 DASHBOARD_DIR = Path(__file__).parent
 FILTERS_PATH = DASHBOARD_DIR / "last_filters.json"
@@ -406,68 +408,30 @@ def fetch_contexte_mdb():
     return ctx
 
 
-def compute_mdb_scores(
-    df_scope, df_all, peb_cibles, taux_enregistrement_pct, cout_travaux_m2,
-    frais_vente_pct, taux_financier_annuel_pct, duree_portage_mois, appliquer_isoc, isoc_pct,
-    decote_arv_pct=8.0, frais_notaire_pct=1.6, frais_acte_eur=1300,
-    tva_travaux_pct=6.0, charges_portage_mensuelles=180, prix_m2_plancher=400,
-    majoration_encheres_pct=0.0,
-):
-    """Marge d'un flip MdB, structurée comme `charge_fonciere.py` (Dev Log
-    2026-08-31 : C = (R_nette − Cc − Ca − Marge − 0,5·Cc·f) / (1 + e + f)) —
-    mais ici le prix d'achat est CONNU (l'annonce), donc pas de circularité à
-    résoudre : on calcule la marge résultante plutôt que le prix maximum.
+def compute_mdb_scores(df_scope, df_all, peb_cibles, h, prix_m2_plancher=400):
+    """Marge d'un flip MdB — calculée par le MOTEUR UNIQUE `moteur_sourcing.py` (06/10), le même que
+    l'agent sourcing du serveur : une seule formule, une seule source d'hypothèses (`params_utilisateur`).
 
-    Corrige les deux trous identifiés dans l'ancienne formule "référence
-    rapide" (notés comme un bug réel dans Moubri.md sur le rapport Fichaux 6) :
-    les frais de revente et le coût de portage/financement étaient absents.
+    Ce qui a changé le 06/10 (décisions d'Antoine) par rapport à l'ancienne version de cette fonction :
+      - droits 12,5 % avec 3/5 restitués à la revente (et non plus un taux net saisi à la main) ;
+      - honoraires notaire = barème légal + TVA + frais d'acte (et non plus un % forfaitaire) ;
+      - travaux = grille €/m² par PEB (et non plus un forfait unique pour tous les biens) ;
+      - comparables de revente par CP + commune + type + tranche de surface, repli sur la même commune
+        toutes tailles, et JAMAIS de repli régional : sans assez de comparables, « non calculable ».
+    Les garde-fous historiques restent : vente seulement, maison/appartement, surfaces plausibles,
+    plancher de prix/m² (16/09), comparables = prix demandés minorés de la décote."""
+    refs = ReferencesRevente(h.nb_min_comparables)
+    comp = df_all[(df_all["type_transaction"] == "vente") & df_all["type_bien"].isin(["maison", "appartement"])
+                  & (df_all["source_prix"] == "immoweb")]
+    for cp, commune, t, s, p, peb, neuf in zip(comp["code_postal"], comp["commune"], comp["type_bien"],
+                                               comp["surface_habitable"], comp["prix"], comp["peb"], comp["est_neuf"]):
+        if pd.notna(s) and pd.notna(p):
+            refs.ajouter(cp, commune, t, s, p, peb, bool(neuf))
 
-    ARV comparé sur des ANNONCES (prix demandés, pas des ventes réelles) —
-    limite connue, à améliorer en branchant `transactions_spf_wallonie`.
-    """
-    # ⚠️ Comparables et scope limités à la VENTE — un loyer mensuel (ex. 2100 €)
-    # traité comme un prix d'achat produirait un prix/m² comparable délirant et
-    # fausserait l'ARV même pour les biens à vendre analysés en même temps.
-    #
-    # Trouvé le 16/09 en vérifiant l'ARV sur demande utilisateur : la base de comparables
-    # n'était filtrée NI sur le type de bien NI sur la plausibilité du prix. 6,8% des
-    # comparables (261/3841) étaient des biens commerciaux/industriels/immeubles de
-    # rapport — sans rapport avec le prix/m² d'une maison ou d'un appartement rénové —
-    # et faisaient dévier l'ARV jusqu'à +92%/-38% dans les communes à peu de comparables.
-    # Corrigé en appliquant le MÊME filtre type de bien + plancher de plausibilité que
-    # sur le scope `d` ci-dessous : la base de comparaison et le bien évalué doivent
-    # appartenir au même univers.
-    comp_prix_m2_ok = (df_all["prix"] / df_all["surface_habitable"]).where(
-        df_all["surface_habitable"] > 0) >= prix_m2_plancher
-    comp_base = df_all[
-        df_all["peb"].isin(PEB_RENOVES) & (df_all["type_transaction"] == "vente")
-        & df_all["type_bien"].isin(["maison", "appartement"])
-        & df_all["surface_habitable"].between(15, 600)
-        & comp_prix_m2_ok
-    ]
-    comp_commune = comp_base.groupby("commune_norm")["prix_m2"].median()
-    comp_region = comp_base.groupby("region")["prix_m2"].median()
-    comp_commune_n = comp_base.groupby("commune_norm")["prix_m2"].count()
-
-    # Garde-fou plausibilité : la surface habitable est un champ connu pour ses
-    # erreurs de collecte (souvent confondue avec la surface du terrain). Une
-    # "maison" de 2000 m² à 100 000 € n'est pas un bon deal, c'est une donnée
-    # fausse — sans ce filtre elle remonte artificiellement en tête de liste.
     surface_ok = (
         (df_scope["type_bien"].eq("appartement") & df_scope["surface_habitable"].between(15, 350))
         | (df_scope["type_bien"].eq("maison") & df_scope["surface_habitable"].between(25, 600))
     )
-    # Garde-fou plausibilité n°2, trouvé le 16/09 en creusant les meilleures opportunités
-    # du filtre 🎯 objectif : une traîne de prix/m² implausibles (jusqu'à 25 €/m²)
-    # faussait le haut du classement. Sur-représentés chez les enchères (biddit.be,
-    # notaire.be "opportunité" — prix de départ, pas prix de vente attendu) mais 70%
-    # restent des annonces Immoweb classiques (erreur de saisie probable). Seuil recalibré
-    # le même jour après vérification manuelle par l'utilisateur : entre 400 et 750 €/m²,
-    # la population est majoritairement du marché réel (Charleroi, Gilly, Boussu,
-    # Marchienne-au-Pont — marchés wallons dégradés authentiques), pas un artefact. En
-    # dessous, aucune coupure statistique nette n'existe (le mélange auction/erreur/marché
-    # réel est continu) — le seuil de 400 €/m² est donc une estimation prudente, pas une
-    # frontière prouvée : à ajuster si le terrain montre autre chose.
     prix_m2_ok = (df_scope["prix"] / df_scope["surface_habitable"]).where(
         df_scope["surface_habitable"] > 0) >= prix_m2_plancher
     d = df_scope[
@@ -481,71 +445,28 @@ def compute_mdb_scores(
     if d.empty:
         return d
 
-    # Biddit/notaire.be "opportunité" affichent une mise à prix, pas un prix de vente
-    # attendu — traiter ce prix comme ferme sous-estimerait le coût réel d'acquisition.
-    # `prix` reste le prix AFFICHÉ (tri, référence) ; `prix_acquisition` est celui
-    # utilisé dans TOUS les calculs de coût/marge ci-dessous. Majoration à 0% par défaut
-    # (aucune statistique belge fiable trouvée le 16/09 sur l'écart mise à prix -> prix
-    # adjugé) — paramètre volontairement laissé à calibrer par l'utilisateur plutôt que
-    # par un chiffre inventé.
+    # Biddit/notaire.be : mise à prix, pas prix de vente attendu -> majoration (params_utilisateur).
     d["est_enchere"] = d["source_prix"].isin(SOURCES_ENCHERE)
-    d["prix_acquisition"] = d["prix"] * d["est_enchere"].map(
-        {True: 1 + majoration_encheres_pct / 100, False: 1.0})
+    d["prix_acquisition"] = d["prix"] * d["est_enchere"].map({True: 1 + h.majoration_encheres, False: 1.0})
 
-    n_comp = d["commune_norm"].map(comp_commune_n).fillna(0)
-    comp_m2 = d["commune_norm"].map(comp_commune)
-    comp_m2 = comp_m2.where(n_comp >= 5, d["region"].map(comp_region))
-    d["n_comparables"] = n_comp.astype(int)
-    d["comparable_source"] = ["commune" if n >= 5 else "région" for n in n_comp]
-
-    e = taux_enregistrement_pct / 100
-    f = (taux_financier_annuel_pct / 100) * (duree_portage_mois / 12)
-
-    # ARV : les comparables sont des PRIX DEMANDÉS. Mesuré le 2026-09-16 sur 81 communes :
-    # le prix demandé médian vaut ~1,24× le prix réellement acté (Statbel). Une partie est
-    # un effet de stock (les biens surévalués restent en vitrine), une partie est la vraie
-    # marge de négociation — d'où une décote paramétrable plutôt qu'un chiffre figé.
-    # L'ancien code appliquait ×1,05, ce qui AGGRAVAIT le biais optimiste.
-    d["arv_brut"] = comp_m2 * d["surface_habitable"] * (1 - decote_arv_pct / 100)
-
-    # Travaux TVA comprise (6% si bâtiment >10 ans, 21% sinon) — 15 points d'écart
-    # sur tout le budget travaux, soit souvent plus que la marge de sécurité du deal.
-    d["cout_travaux"] = d["surface_habitable"] * cout_travaux_m2 * (1 + tva_travaux_pct / 100)
-
-    # Coûts d'acquisition : droits d'enregistrement + honoraires notaire + frais d'acte.
-    # Les deux derniers étaient totalement absents : ~3-4 k€ sur un bien à 150 k€,
-    # soit 2-3% du deal pris directement sur la marge.
-    d["cout_enregistrement"] = d["prix_acquisition"] * e
-    d["frais_acquisition"] = d["prix_acquisition"] * (frais_notaire_pct / 100) + frais_acte_eur
-
-    # Portage : capital immobilisé = prix payé dès le jour 1 + travaux tirés
-    # progressivement (approximé à la moitié du budget travaux, comme dans
-    # charge_fonciere.py : "0,5·Cc·f").
-    d["cout_financier"] = (d["prix_acquisition"] + 0.5 * d["cout_travaux"]) * f
-    # Charges de détention (précompte immobilier, assurance, énergie, syndic) —
-    # absentes de l'ancienne formule.
-    d["charges_portage"] = charges_portage_mensuelles * duree_portage_mois
-    d["cout_vente"] = d["arv_brut"] * (frais_vente_pct / 100)
-
-    d["marge_eur"] = (
-        d["arv_brut"] - d["prix_acquisition"] - d["cout_enregistrement"] - d["frais_acquisition"]
-        - d["cout_travaux"] - d["cout_financier"] - d["charges_portage"] - d["cout_vente"]
-    )
-    if appliquer_isoc:
-        d["marge_eur"] = d["marge_eur"].clip(lower=0) * (1 - isoc_pct / 100) + d["marge_eur"].clip(upper=0)
-    d["marge_pct"] = (d["marge_eur"] / d["arv_brut"] * 100)
-
-    # Capital réellement immobilisé — base de rendement bien plus parlante pour un MdB
-    # que la marge rapportée à l'ARV.
-    d["capital_engage"] = (
-        d["prix_acquisition"] + d["cout_enregistrement"] + d["frais_acquisition"]
-        + d["cout_travaux"] + d["charges_portage"]
-    )
-    d["roi_pct"] = d["marge_eur"] / d["capital_engage"] * 100
-    # La rotation du capital EST le métier : 12% en 6 mois bat 20% en 18 mois.
-    d["roi_annualise_pct"] = d["roi_pct"] * (12 / max(duree_portage_mois, 1))
-
-    d = d[d["arv_brut"].notna() & d["marge_pct"].notna()]
+    lignes = []
+    for idx, r in d.iterrows():
+        m2, n, niveau = refs.prix_m2(r["code_postal"], r["commune"], r["type_bien"], r["surface_habitable"])
+        if not m2:
+            continue
+        b = moteur_flip(r["prix_acquisition"], r["surface_habitable"], r["peb"], m2, h)
+        lignes.append(dict(
+            idx=idx, n_comparables=n, comparable_source=niveau, arv_brut=b["arv"], cout_travaux=b["travaux"],
+            cout_enregistrement=b["droits_net"], frais_acquisition=b["notaire"] + b["divers"],
+            cout_financier=b["financement"], charges_portage=b["charges"], cout_vente=b["frais_revente"],
+            marge_eur=b["marge"], marge_pct=b["marge_pct"] * 100, capital_engage=b["capital_engage"],
+            roi_pct=b["roi"] * 100, roi_annualise_pct=b["roi"] * 100 * 12 / max(b["mois"], 1), prix_max=b["prix_max"]))
+    non_calculables = len(d) - len(lignes)
+    if not lignes:
+        d = d.iloc[0:0]
+    else:
+        d = d.join(pd.DataFrame(lignes).set_index("idx"), how="inner")
+    d.attrs["non_calculables"] = non_calculables   # pas assez de biens rénovés comparables dans la commune
     return d
 
 
@@ -563,10 +484,12 @@ def compute_mdb_scores_enrichi(*args, **kwargs):
     if ctx.empty:
         return d
 
+    non_calculables = d.attrs.get("non_calculables", 0)
     d = d.merge(
         ctx[["commune_norm", "prix_median_maison", "dans_zone_houillere", "anciennete_active_jours"]],
         on="commune_norm", how="left",
     )
+    d.attrs["non_calculables"] = non_calculables
     # Garde-fou de sortie : un ARV très au-dessus du prix médian RÉELLEMENT acté de la
     # commune signale une hypothèse de revente agressive (ou un bien atypique) — c'est
     # là que les plans de MdB se cassent, pas sur le coût des travaux.
@@ -747,33 +670,35 @@ with st.sidebar.expander("Plus de filtres"):
 st.sidebar.markdown("---")
 st.sidebar.subheader("🎯 Analyse marchand de biens")
 with st.sidebar.expander("Hypothèses de calcul", expanded=False):
-    peb_cibles = st.multiselect("PEB cible (achat dégradé)", ["G", "F", "E", "D", "C"], default=defaults.get("peb_cibles", ["G", "F", "E"]))
-    taux_enregistrement_pct = st.number_input("Droits d'enregistrement (%)", min_value=0.0, max_value=20.0, value=defaults.get("taux_enregistrement_pct", 7.5), step=0.5, help="Non confirmé avec un comptable (régime MdB) — voir Shortlist-GO-Mons-2026-06-11.")
-    frais_notaire_pct = st.number_input("Honoraires notaire (%)", min_value=0.0, max_value=5.0, value=defaults.get("frais_notaire_pct", 1.6), step=0.1, help="Honoraires dégressifs, hors droits d'enregistrement. Étaient totalement absents du calcul avant le 16/09.")
-    frais_acte_eur = st.number_input("Frais d'acte fixes (€)", min_value=0, max_value=10000, value=defaults.get("frais_acte_eur", 1300), step=100, help="Recherches, formalités, transcription hypothécaire.")
-    decote_arv_pct = st.number_input("Décote prix demandé → prix acté (%)", min_value=0.0, max_value=40.0, value=defaults.get("decote_arv_pct", 8.0), step=1.0, help="Les comparables sont des PRIX DEMANDÉS. Mesuré sur 81 communes le 16/09 : le demandé médian vaut 1,24× l'acté Statbel (interquartile 1,12–1,38) — une partie est un effet de stock, une partie une vraie marge de négociation. 8% = prudent ; 0% = vous croyez le prix affiché.")
-    cout_travaux_m2 = st.number_input("Coût travaux HTVA (€/m²)", min_value=0, max_value=3000, value=defaults.get("cout_travaux_m2", 1400), step=50, help="Corrigé le 16/09 : l'ancien forfait (850€) était sous le marché réel — sources agrégées 2026 (ABEX 1056) : 1 100-1 800 €/m² pour une rénovation lourde visant PEB A/B, jusqu'à 1 500-2 500 €/m² avec isolation/toiture/mise aux normes complètes. 1 400€ est un point médian, PAS un devis ni une grille par palier PEB — comptez vers le haut de la fourchette pour un G, vers le bas pour un E (grille par palier pas encore construite, sur le board).")
-    prix_m2_plancher = st.number_input("Plancher de plausibilité prix/m² (€)", min_value=0, max_value=2000, value=defaults.get("prix_m2_plancher", 400), step=50, help="Trouvé le 16/09 : une traîne d'annonces à prix/m² implausible (jusqu'à 25 €/m²) faussait le haut du classement. Recalibré le même jour après vérification terrain : au-dessus de 400 €/m², c'est majoritairement du marché wallon dégradé réel (Charleroi, Gilly, Boussu...), pas un artefact — en dessous, aucune coupure nette n'existe entre marché réel et erreur de donnée. Sous ce seuil, une annonce est écartée du scoring, ET des comparables utilisés pour l'ARV.")
-    majoration_encheres_pct = st.number_input("Majoration prix pour Biddit/notaire.be enchères (%)", min_value=0.0, max_value=100.0, value=defaults.get("majoration_encheres_pct", 0.0), step=5.0, help="Biddit (ventes judiciaires) et les \"opportunités\" immo.notaire.be affichent une MISE À PRIX, pas un prix de vente attendu — traiter ce prix comme ferme sous-estime le coût réel. Aucune statistique belge fiable trouvée le 16/09 sur l'écart moyen mise à prix → prix adjugé : par défaut à 0% (pas de chiffre inventé). Si vous avez une expérience de terrain sur ces enchères, réglez ce paramètre vous-même — il majore le prix retenu pour TOUS les calculs de coût/marge sur ces deux sources, la colonne \"Source\" du tableau les identifie.")
-    tva_travaux_pct = st.number_input("TVA travaux (%)", min_value=0.0, max_value=21.0, value=defaults.get("tva_travaux_pct", 6.0), step=15.0, help="6% pour un bâtiment de plus de 10 ans, 21% sinon. 15 points d'écart sur tout le budget travaux.")
-    charges_portage_mensuelles = st.number_input("Charges de détention (€/mois)", min_value=0, max_value=3000, value=defaults.get("charges_portage_mensuelles", 180), step=20, help="Précompte immobilier, assurance, énergie, syndic. Absentes du calcul avant le 16/09.")
-    frais_vente_pct = st.number_input("Frais de revente (%)", min_value=0.0, max_value=15.0, value=defaults.get("frais_vente_pct", 6.0), step=0.5, help="Agence + notaire à la revente. Absent de l'ancienne formule — c'est le bug déjà noté sur le rapport Fichaux 6.")
-    _taux_bce_defaut = 5.0
+    # Valeurs par défaut = params_utilisateur (référence unique partagée avec l'agent sourcing, 06/10).
+    # Les clés de sauvegarde sont préfixées « h2_ » : les anciens réglages sauvegardés (7,5 % de droits,
+    # 1 400 €/m² de travaux...) ne s'appliquent plus silencieusement.
     try:
-        _taux_ref = fetch_reference("v_dashboard_taux", "type_taux,valeur")
-        _bce_row = _taux_ref[_taux_ref["type_taux"] == "bce_facilite_depot"]
-        if not _bce_row.empty:
-            _taux_bce_defaut = float(_bce_row.iloc[0]["valeur"]) + 1.0
+        _h_ref = Hypotheses.depuis_params(fetch_reference("params_utilisateur", "param_nom,param_valeur").to_dict("records"))
     except Exception:
-        pass
-    taux_financier_annuel_pct = st.number_input("Coût du capital annuel (%)", min_value=0.0, max_value=15.0, value=defaults.get("taux_financier_annuel_pct", round(_taux_bce_defaut, 2)), step=0.5, help=f"Taux de financement ou coût d'opportunité si cash. Défaut suggéré : BCE (facilité de dépôt) + 1 point = {_taux_bce_defaut:.2f} % — variable, indexé sur les décisions futures de la BCE, pas figé à la signature.")
-    duree_portage_mois = st.number_input("Durée de portage (mois)", min_value=1, max_value=60, value=defaults.get("duree_portage_mois", 9), step=1)
+        _h_ref = Hypotheses()
+    peb_cibles = st.multiselect("PEB cible (achat dégradé)", ["G", "F", "E", "D", "C"], default=defaults.get("peb_cibles", ["G", "F", "E"]))
+    droits_pct = st.number_input("Droits d'enregistrement payés à l'achat (%)", min_value=0.0, max_value=20.0, value=defaults.get("h2_droits_pct", _h_ref.droits_taux * 100), step=0.5)
+    restitution_pct = st.number_input("Part des droits restituée à la revente (%)", min_value=0.0, max_value=100.0, value=defaults.get("h2_restitution_pct", _h_ref.restitution * 100), step=10.0, help="Régime marchand de biens : 3/5 des droits restitués si revente dans les délais. Le financement porte sur la totalité des droits avancés.")
+    st.caption("Honoraires notaire : barème légal (barème J, AR du 16/12/1950) + TVA 21 %, plus les frais d'acte ci-dessous.")
+    frais_acte_eur = st.number_input("Frais d'acte fixes (€)", min_value=0, max_value=10000, value=int(defaults.get("h2_frais_acte_eur", _h_ref.frais_acte)), step=100, help="Recherches, formalités, transcription hypothécaire.")
+    decote_arv_pct = st.number_input("Décote prix demandé → prix acté (%)", min_value=0.0, max_value=40.0, value=defaults.get("h2_decote_arv_pct", _h_ref.decote_arv * 100), step=1.0, help="Les comparables sont des PRIX DEMANDÉS. Mesuré sur 81 communes le 16/09 : le demandé médian vaut 1,24× l'acté Statbel (interquartile 1,12–1,38).")
+    st.markdown("**Travaux HTVA par PEB (€/m²)** — grille de params_utilisateur, recalée le 06/10")
+    st.caption(" · ".join(f"{p} {_h_ref.travaux_m2[p]:.0f}" for p in ("B", "C", "D", "E", "F", "G")) + f" · inconnu {_h_ref.travaux_inconnu:.0f}")
+    ajustement_travaux_pct = st.number_input("Ajustement de la grille (%)", min_value=-50.0, max_value=200.0, value=defaults.get("h2_ajustement_travaux_pct", 0.0), step=10.0, help="+20 % = tous les forfaits de la grille augmentés de 20 % pour tester la sensibilité. La grille elle-même se modifie dans params_utilisateur.")
+    prix_m2_plancher = st.number_input("Plancher de plausibilité prix/m² (€)", min_value=0, max_value=2000, value=defaults.get("prix_m2_plancher", 400), step=50, help="Trouvé le 16/09 : une traîne d'annonces à prix/m² implausible (jusqu'à 25 €/m²) faussait le haut du classement. Au-dessus de 400 €/m², c'est majoritairement du marché wallon dégradé réel. Sous ce seuil, une annonce est écartée du scoring, ET des comparables utilisés pour l'ARV.")
+    majoration_encheres_pct = st.number_input("Majoration prix pour Biddit/notaire.be (%)", min_value=0.0, max_value=100.0, value=defaults.get("h2_majoration_encheres_pct", _h_ref.majoration_encheres * 100), step=5.0, help="Biddit et notaire.be affichent une MISE À PRIX (plancher), pas un prix de vente attendu. 0 % tant que les prix adjugés ne sont pas mesurés.")
+    tva_travaux_pct = st.number_input("TVA travaux (%)", min_value=0.0, max_value=21.0, value=defaults.get("h2_tva_travaux_pct", _h_ref.tva_travaux * 100), step=15.0, help="6% pour un bâtiment de plus de 10 ans, 21% sinon.")
+    charges_portage_mensuelles = st.number_input("Charges de détention (€/mois)", min_value=0, max_value=3000, value=int(defaults.get("h2_charges_portage_mensuelles", _h_ref.charges_mois)), step=20, help="Précompte immobilier, assurance, énergie, syndic.")
+    frais_vente_pct = st.number_input("Frais de revente (%)", min_value=0.0, max_value=15.0, value=defaults.get("h2_frais_vente_pct", _h_ref.frais_revente_taux * 100), step=0.5, help="0 % : revente en interne (décision du 06/10). Mettez 3-6 % pour simuler une revente par agence.")
+    taux_financier_annuel_pct = st.number_input("Coût du capital annuel (%)", min_value=0.0, max_value=15.0, value=defaults.get("h2_taux_financier_annuel_pct", round(_h_ref.taux_financement * 100, 2)), step=0.5, help="Taux de financement ou coût d'opportunité si cash (params_utilisateur : taux_credit_hypothecaire_ref).")
+    duree_portage_mois = st.number_input("Durée de portage (mois)", min_value=1, max_value=60, value=int(defaults.get("h2_duree_portage_mois", _h_ref.portage_mois)), step=1)
     appliquer_isoc = st.checkbox("Vente via société — appliquer l'ISOC sur la marge", value=defaults.get("appliquer_isoc", False))
     isoc_pct = st.number_input("Taux ISOC (%)", min_value=0.0, max_value=40.0, value=defaults.get("isoc_pct", 25.0), step=1.0, disabled=not appliquer_isoc)
     st.markdown("**Seuils de classement**")
     seuil_go_fort = st.number_input("Seuil GO fort (marge % ≥)", min_value=0, max_value=200, value=defaults.get("seuil_go_fort", 30), step=5)
-    seuil_go = st.number_input("Seuil GO (marge % ≥)", min_value=0, max_value=200, value=defaults.get("seuil_go", 15), step=5)
-    seuil_limite = st.number_input("Seuil Limite (marge % ≥)", min_value=0, max_value=200, value=defaults.get("seuil_limite", 5), step=5)
+    seuil_go = st.number_input("Seuil GO (marge % ≥)", min_value=0, max_value=200, value=int(defaults.get("h2_seuil_go", _h_ref.seuil_go * 100)), step=5)
+    seuil_limite = st.number_input("Seuil Limite (marge % ≥)", min_value=0, max_value=200, value=int(defaults.get("h2_seuil_limite", _h_ref.seuil_limite * 100)), step=5)
     st.markdown("**🎯 Objectif de portefeuille**")
     st.caption("Un bien peut être « GO » sur la marge et hors de portée sur la vélocité — voir "
                "*Trajectoire patrimoniale*. Ces deux seuils marquent les biens qui tiennent "
@@ -781,21 +706,29 @@ with st.sidebar.expander("Hypothèses de calcul", expanded=False):
     ticket_cible_eur = st.number_input("Ticket cible — capital engagé max (€)", min_value=50_000, max_value=1_000_000, value=defaults.get("ticket_cible_eur", 250_000), step=25_000, help="Gisement réel mesuré le 16/09 : sous 250 k€ de capital engagé, le ROI net annualisé médian grimpe à 28-32 % et permet 2,6 opérations en parallèle avec 500 k€ contre 1,4 sans ce plafond.")
     roi_min_vise_pct = st.number_input("ROI net annualisé minimum visé (%)", min_value=0.0, max_value=100.0, value=defaults.get("roi_min_vise_pct", 15.0), step=1.0, help="Le seuil arithmétique pour tenir l'objectif de revenu tourne autour de 10-11 %/an (revue financière du 16/09, annualisation composée) — 15 % laisse une marge de sécurité sur ce même ROI, mais annualisé ici de façon linéaire (roi_pct × 12/durée), cohérent avec la colonne « ROI annualisé % » déjà affichée dans le tableau.")
 
+_k = 1 + ajustement_travaux_pct / 100
+h_dash = dataclasses.replace(
+    _h_ref, droits_taux=droits_pct / 100, restitution=restitution_pct / 100, frais_acte=frais_acte_eur,
+    decote_arv=decote_arv_pct / 100, travaux_m2={p: v * _k for p, v in _h_ref.travaux_m2.items()},
+    travaux_inconnu=_h_ref.travaux_inconnu * _k, majoration_encheres=majoration_encheres_pct / 100,
+    tva_travaux=tva_travaux_pct / 100, charges_mois=charges_portage_mensuelles, frais_revente_taux=frais_vente_pct / 100,
+    taux_financement=taux_financier_annuel_pct / 100, portage_mois=duree_portage_mois,
+    isoc=(isoc_pct / 100 if appliquer_isoc else None), seuil_go=seuil_go / 100, seuil_limite=seuil_limite / 100)
+
 if st.sidebar.button("💾 Sauvegarder ces critères par défaut"):
     save_last_filters({
         "transaction": transaction, "regions": regions_sel, "commune_query": commune_query,
         "budget": [budget_min, budget_max], "surf_min": surf_min, "types": types_sel,
         "chambres_min": chambres_min, "annee_min": annee_min, "jours_max": jours_max,
-        "peb_cibles": peb_cibles, "taux_enregistrement_pct": taux_enregistrement_pct,
-        "cout_travaux_m2": cout_travaux_m2, "frais_vente_pct": frais_vente_pct,
-        "frais_notaire_pct": frais_notaire_pct, "frais_acte_eur": frais_acte_eur,
-        "decote_arv_pct": decote_arv_pct, "tva_travaux_pct": tva_travaux_pct,
-        "charges_portage_mensuelles": charges_portage_mensuelles,
-        "taux_financier_annuel_pct": taux_financier_annuel_pct, "duree_portage_mois": duree_portage_mois,
+        "peb_cibles": peb_cibles, "h2_droits_pct": droits_pct, "h2_restitution_pct": restitution_pct,
+        "h2_ajustement_travaux_pct": ajustement_travaux_pct, "h2_frais_vente_pct": frais_vente_pct,
+        "h2_frais_acte_eur": frais_acte_eur, "h2_decote_arv_pct": decote_arv_pct, "h2_tva_travaux_pct": tva_travaux_pct,
+        "h2_charges_portage_mensuelles": charges_portage_mensuelles,
+        "h2_taux_financier_annuel_pct": taux_financier_annuel_pct, "h2_duree_portage_mois": duree_portage_mois,
         "appliquer_isoc": appliquer_isoc, "isoc_pct": isoc_pct,
-        "seuil_go_fort": seuil_go_fort, "seuil_go": seuil_go, "seuil_limite": seuil_limite,
+        "seuil_go_fort": seuil_go_fort, "h2_seuil_go": seuil_go, "h2_seuil_limite": seuil_limite,
         "prix_m2_plancher": prix_m2_plancher, "ticket_cible_eur": ticket_cible_eur,
-        "roi_min_vise_pct": roi_min_vise_pct, "majoration_encheres_pct": majoration_encheres_pct,
+        "roi_min_vise_pct": roi_min_vise_pct, "h2_majoration_encheres_pct": majoration_encheres_pct,
     })
     st.sidebar.success("Enregistré ✓")
 
@@ -1232,7 +1165,8 @@ if transaction == "vente":
     st.caption(
         "Étape suivante, optionnelle : simule une rénovation complète plutôt qu'une simple "
         "comparaison de prix — plus riche, mais plus d'hypothèses à faire confiance. "
-        "Marge = ARV − prix − enregistrement − **honoraires notaire & frais d'acte** − travaux TVAC "
+        "Même moteur que l'agent sourcing (moteur_sourcing.py), hypothèses de params_utilisateur. "
+        "Marge = ARV − prix − droits nets (12,5 % − 3/5 restitués) − **notaire au barème légal & frais d'acte** − travaux TVAC (grille par PEB) "
         "− portage/financement − **charges de détention** − frais de revente"
         + (" − ISOC" if appliquer_isoc else "") + ". "
         f"ARV = comparables PEB A-B du secteur (**prix demandés**) minorés de la décote de négociation "
@@ -1244,14 +1178,7 @@ if transaction == "vente":
         "**Un tri pour prioriser les visites, jamais une offre.**"
     )
 
-    mdb = compute_mdb_scores_enrichi(
-        f, df, peb_cibles, taux_enregistrement_pct, cout_travaux_m2,
-        frais_vente_pct, taux_financier_annuel_pct, duree_portage_mois, appliquer_isoc, isoc_pct,
-        decote_arv_pct=decote_arv_pct, frais_notaire_pct=frais_notaire_pct,
-        frais_acte_eur=frais_acte_eur, tva_travaux_pct=tva_travaux_pct,
-        charges_portage_mensuelles=charges_portage_mensuelles,
-        prix_m2_plancher=prix_m2_plancher, majoration_encheres_pct=majoration_encheres_pct,
-    )
+    mdb = compute_mdb_scores_enrichi(f, df, peb_cibles, h_dash, prix_m2_plancher=prix_m2_plancher)
 
     if mdb.empty:
         st.info("Aucun bien PEB " + "/".join(peb_cibles) + " (maison ou appartement) dans la sélection actuelle.")
@@ -1277,9 +1204,10 @@ if transaction == "vente":
                        f"le gisement qui tient réellement le rythme requis pour l'objectif de revenu, "
                        f"pas seulement la marge. Voir *Trajectoire patrimoniale*.".replace(",", " "))
 
-        low_n = int((mdb["n_comparables"] < 5).sum())
-        if low_n:
-            st.caption(f"⚠️ {low_n} biens notés avec un comparable de secours au niveau région (moins de 5 annonces PEB A-B trouvées dans leur commune) — marge moins fiable pour ceux-là, colonne « Comparable ».")
+        n_nc = mdb.attrs.get("non_calculables", 0)
+        if n_nc:
+            st.caption(f"ℹ️ {n_nc} biens non calculables : moins de {h_dash.nb_min_comparables} biens rénovés comparables "
+                       "dans leur CP + commune. Jamais de repli sur la région (06/10) — la précision prime.")
 
         filtrer_objectif = st.checkbox(
             "🎯 N'afficher que le gisement dans l'objectif de revenu",
@@ -1297,12 +1225,12 @@ if transaction == "vente":
             + show.get("dans_zone_houillere", False).fillna(False).map({True: "⛏️ Minier", False: ""})
         ).str.strip()
         top_table = show[
-            ["statut", "signal", "commune", "code_postal", "prix", "prix_acquisition", "peb", "surface_habitable", "nb_chambres",
+            ["statut", "signal", "commune", "code_postal", "prix", "prix_max", "prix_acquisition", "peb", "surface_habitable", "nb_chambres",
              "jours_sur_marche", "arv_brut", "arv_vs_marche_pct", "cout_travaux", "capital_engage",
              "marge_eur", "marge_pct", "roi_annualise_pct", "comparable_source", "n_comparables", "url_principale"]
         ].rename(columns={
             "statut": "Statut", "signal": "Signal", "commune": "Commune", "code_postal": "CP", "prix": "Prix affiché (€)",
-            "prix_acquisition": "Prix retenu au calcul (€)",
+            "prix_acquisition": "Prix retenu au calcul (€)", "prix_max": "Prix max (€)",
             "peb": "PEB", "surface_habitable": "Surface (m²)", "nb_chambres": "Ch.",
             "jours_sur_marche": "Jours en ligne", "arv_brut": "ARV (€)",
             "arv_vs_marche_pct": "ARV vs marché acté", "cout_travaux": "Travaux TVAC (€)",
@@ -1323,6 +1251,9 @@ if transaction == "vente":
                     "ROI annualisé %", format="%.0f %%",
                     help="Marge / capital réellement engagé, ramenée à l'année. La rotation du capital est le nerf du métier : 12% en 6 mois bat 20% en 18 mois."),
                 "Marge (€)": st.column_config.NumberColumn("Marge (€)", format="%d €"),
+                "Prix max (€)": st.column_config.NumberColumn(
+                    "Prix max (€)", format="%d €",
+                    help="Prix d'achat qui garde exactement le seuil GO de marge — même calcul que l'agent sourcing."),
                 "Capital engagé (€)": st.column_config.NumberColumn("Capital engagé (€)", format="%d €"),
                 "Prix (€)": st.column_config.NumberColumn("Prix (€)", format="%d €"),
                 "ARV (€)": st.column_config.NumberColumn("ARV (€)", format="%d €"),
